@@ -3,7 +3,7 @@
 #  iZONE ENTERPRISE - BACKUPS
 #  Gestor de respaldos para Frappe / ERPNext
 #  Destinos soportados: Unidad de Red (CIFS) y Google Drive (rclone)
-#  Version: 2.1.3
+#  Version: 2.1.5
 #
 #  Uso:  sudo ./izone-backup-manager.sh
 # =====================================================================
@@ -300,13 +300,45 @@ requiere_root() {
   fi
 }
 
+ayuda_repo_roto() {
+  say "    ${C_DIM}Si hay un repositorio de terceros roto, desactivelo y reintente:${C_R}"
+  say "    ${C_DIM}  ls /etc/apt/sources.list.d/${C_R}"
+  say "    ${C_DIM}  sudo mv /etc/apt/sources.list.d/<archivo>.list{,.disabled}${C_R}"
+  say "    ${C_DIM}  sudo apt-get update${C_R}"
+  return 0
+}
+
 asegurar_paquete() {
-  local pkg="$1" cmd="$2"
+  local pkg="$1" cmd="$2" salida roto
   command -v "$cmd" >/dev/null 2>&1 && { ok "'$pkg' ya esta instalado."; return 0; }
+
   info "Instalando '$pkg'..."
-  apt-get update -qq && apt-get install -y "$pkg" >/dev/null 2>&1
-  if command -v "$cmd" >/dev/null 2>&1; then ok "'$pkg' instalado."; return 0
-  else err "No se pudo instalar '$pkg'."; return 1; fi
+  salida="$(apt-get update 2>&1)"
+  if printf '%s' "$salida" | grep -q "^E:"; then
+    roto="$(printf '%s' "$salida" | grep -oP "(?<=The repository ')[^']+" | head -n 1)"
+    warn "Un repositorio de terceros no responde; se continua igual."
+    [ -n "$roto" ] && say "    ${C_DIM}${roto}${C_R}"
+  fi
+
+  # --no-remove: si apt necesitara eliminar paquetes para resolver la
+  # instalacion, aborta en vez de tocar el sistema.
+  salida="$(apt-get install -y --no-remove "$pkg" 2>&1)"
+  if command -v "$cmd" >/dev/null 2>&1; then ok "'$pkg' instalado."; return 0; fi
+
+  err "No se pudo instalar '$pkg'."
+  printf '%s\n' "$salida" | grep -iE "^E:|Unable to locate|no installation candidate" | head -n 3 | sed 's/^/    /'
+  ayuda_repo_roto
+
+  if [ "$pkg" = "rclone" ]; then
+    echo
+    if si_no "rclone tiene un instalador oficial. Usarlo?"; then
+      info "Instalando desde rclone.org..."
+      curl -fsSL https://rclone.org/install.sh | bash >/dev/null 2>&1
+      command -v rclone >/dev/null 2>&1 && { ok "rclone instalado."; return 0; }
+      err "Tampoco se pudo. Revise la salida a internet del servidor."
+    fi
+  fi
+  return 1
 }
 
 # ------------------------------ Frappe -------------------------------
