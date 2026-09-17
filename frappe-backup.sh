@@ -3,7 +3,7 @@
 #  iZONE ENTERPRISE - BACKUPS
 #  Gestor de respaldos para Frappe / ERPNext
 #  Destinos soportados: Unidad de Red (CIFS) y Google Drive (rclone)
-#  Version: 2.1.5
+#  Version: 2.3.0
 #
 #  Uso:  sudo ./izone-backup-manager.sh
 # =====================================================================
@@ -237,6 +237,7 @@ cargar_conf() {
   unset JOB_TIPO JOB_NOMBRE ETIQUETA SERVIDOR RECURSO SUBCARPETA UNC MOUNT_POINT CRED_FILE \
         SMB_VERS MOUNT_OPTS RCLONE_REMOTE DEST_PATH RCLONE_CONFIG TEMP_LOCAL BENCH_PATH \
         SITE BACKUP_ORIGEN WITH_FILES BORRAR_ORIGEN RETENCION_DIAS HORARIOS DIAS_CRON SMB_PORT \
+        MENSUAL_CONSERVAR MENSUAL_MESES \
         LOG_FILE RCLONE_LOG 2>/dev/null
   # shellcheck disable=SC1090
   . "$1"
@@ -390,15 +391,47 @@ pedir_frappe() {
 }
 
 pedir_retencion() {
-  local v
+  local v n
   while true; do
-    say "  ${C_DIM}Dias que se conservan los respaldos en el destino. 0 = no borrar nada.${C_R}"
+    say "  ${C_DIM}Dias que se conservan TODOS los respaldos en el destino. 0 = no borrar nada.${C_R}"
     read -rp "  Dias de retencion: " v || fin_entrada
-    _nav_check "$v"; local n=$?
+    _nav_check "$v"; n=$?
     [ "$n" -ne 0 ] && return "$n"
-    [[ "$v" =~ ^[0-9]+$ ]] && { RETENCION_DIAS="$v"; return 0; }
+    [[ "$v" =~ ^[0-9]+$ ]] && { RETENCION_DIAS="$v"; break; }
     err "Escriba un numero entero (0 o mayor)."
   done
+
+  MENSUAL_CONSERVAR="no"; MENSUAL_MESES="0"
+  [ "$RETENCION_DIAS" -eq 0 ] && return 0
+
+  echo
+  say "  ${C_DIM}Ademas de esos dias se puede conservar el primer respaldo de cada mes,${C_R}"
+  say "  ${C_DIM}para tener historial largo sin guardar todo. Los demas se eliminan.${C_R}"
+  si_no_nav "Conservar un respaldo mensual?"; n=$?
+  case "$n" in
+    2|3) return "$n";;
+    1)   return 0;;
+  esac
+  MENSUAL_CONSERVAR="si"
+  while true; do
+    say "  ${C_DIM}Meses que se conserva ese respaldo mensual. 0 = para siempre.${C_R}"
+    read -rp "  Meses a conservar [12]: " v || fin_entrada
+    v="${v:-12}"
+    _nav_check "$v"; n=$?
+    [ "$n" -ne 0 ] && return "$n"
+    [[ "$v" =~ ^[0-9]+$ ]] && { MENSUAL_MESES="$v"; return 0; }
+    err "Escriba un numero entero (0 o mayor)."
+  done
+}
+
+describir_retencion() {   # describir_retencion <dias> <si/no> <meses>
+  if [ "${1:-0}" -eq 0 ] 2>/dev/null; then echo "sin limite"; return; fi
+  if [ "${2:-no}" = "si" ]; then
+    if [ "${3:-0}" -eq 0 ] 2>/dev/null; then echo "${1} dias + mensual indefinido"
+    else echo "${1} dias + mensual ${3} meses"; fi
+  else
+    echo "${1} dias"
+  fi
 }
 
 # ========================= AYUDAS DE RED =============================
@@ -821,6 +854,45 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 . "$CONF"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
+# Retencion por niveles sobre carpetas <base>/<dd-mes-aaaa>
+retencion_niveles_local() {
+  local base="$1" dias="$2" mensual="$3" meses="$4"
+  [ "${dias:-0}" -gt 0 ] 2>/dev/null || return 0
+  local ahora ym_hoy d nombre ts ym edad dif
+  declare -A pri_ts pri_dir
+  ahora="$(date +%s)"
+  ym_hoy=$(( $(date +%Y) * 12 + 10#$(date +%m) ))
+
+  for d in "$base"/*/; do
+    [ -d "$d" ] || continue
+    nombre="$(basename "$d")"
+    ts="$(LC_ALL=C date -d "${nombre//-/ }" +%s 2>/dev/null)" || continue
+    [ -n "$ts" ] || continue
+    ym="$(date -d "@$ts" +%Y-%m)"
+    if [ -z "${pri_ts[$ym]:-}" ] || [ "$ts" -lt "${pri_ts[$ym]}" ]; then
+      pri_ts[$ym]="$ts"; pri_dir[$ym]="$nombre"
+    fi
+  done
+
+  for d in "$base"/*/; do
+    [ -d "$d" ] || continue
+    nombre="$(basename "$d")"
+    ts="$(LC_ALL=C date -d "${nombre//-/ }" +%s 2>/dev/null)" || continue
+    [ -n "$ts" ] || continue
+    edad=$(( (ahora - ts) / 86400 ))
+    [ "$edad" -le "$dias" ] && continue
+    if [ "$mensual" = "si" ]; then
+      ym="$(date -d "@$ts" +%Y-%m)"
+      if [ "${pri_dir[$ym]:-}" = "$nombre" ]; then
+        [ "${meses:-0}" -eq 0 ] && continue
+        dif=$(( ym_hoy - ( $(date -d "@$ts" +%Y) * 12 + 10#$(date -d "@$ts" +%m) ) ))
+        [ "$dif" -lt "$meses" ] && continue
+      fi
+    fi
+    rm -rf "$d" && log "[INFO] Retencion: eliminado $nombre"
+  done
+}
+
 FECHA="$(date +'%d-%B-%Y' | tr '[:upper:]' '[:lower:]')"
 HORA="$(date +'%H-%M')"
 DESTINO_FINAL="${MOUNT_POINT}/${FECHA}/${HORA}"
@@ -847,10 +919,8 @@ else
 fi
 find "$BACKUP_ORIGEN" -mindepth 1 -type d -empty -delete 2>/dev/null
 
-if [ "${RETENCION_DIAS:-0}" -gt 0 ] 2>/dev/null; then
-  find "$MOUNT_POINT" -mindepth 1 -maxdepth 1 -type d -mtime +"$RETENCION_DIAS" -exec rm -rf {} + 2>/dev/null
-  log "[INFO] Retencion aplicada: mas de ${RETENCION_DIAS} dias"
-fi
+retencion_niveles_local "$MOUNT_POINT" "${RETENCION_DIAS:-0}" \
+  "${MENSUAL_CONSERVAR:-no}" "${MENSUAL_MESES:-0}"
 exit 0
 EOF
   chmod 750 "$2"
@@ -871,6 +941,42 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 . "$CONF"
 export RCLONE_CONFIG="${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}"
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+# Retencion por niveles sobre <remoto>/<dd-mes-aaaa>
+retencion_niveles_drive() {
+  local remoto="$1" dias="$2" mensual="$3" meses="$4"
+  [ "${dias:-0}" -gt 0 ] 2>/dev/null || return 0
+  local ahora ym_hoy nombre ts ym edad dif dirs=()
+  declare -A pri_ts pri_dir
+  ahora="$(date +%s)"
+  ym_hoy=$(( $(date +%Y) * 12 + 10#$(date +%m) ))
+  mapfile -t dirs < <(rclone lsf "$remoto" --dirs-only 2>/dev/null | sed 's:/$::')
+
+  for nombre in "${dirs[@]}"; do
+    ts="$(LC_ALL=C date -d "${nombre//-/ }" +%s 2>/dev/null)" || continue
+    [ -n "$ts" ] || continue
+    ym="$(date -d "@$ts" +%Y-%m)"
+    if [ -z "${pri_ts[$ym]:-}" ] || [ "$ts" -lt "${pri_ts[$ym]}" ]; then
+      pri_ts[$ym]="$ts"; pri_dir[$ym]="$nombre"
+    fi
+  done
+
+  for nombre in "${dirs[@]}"; do
+    ts="$(LC_ALL=C date -d "${nombre//-/ }" +%s 2>/dev/null)" || continue
+    [ -n "$ts" ] || continue
+    edad=$(( (ahora - ts) / 86400 ))
+    [ "$edad" -le "$dias" ] && continue
+    if [ "$mensual" = "si" ]; then
+      ym="$(date -d "@$ts" +%Y-%m)"
+      if [ "${pri_dir[$ym]:-}" = "$nombre" ]; then
+        [ "${meses:-0}" -eq 0 ] && continue
+        dif=$(( ym_hoy - ( $(date -d "@$ts" +%Y) * 12 + 10#$(date -d "@$ts" +%m) ) ))
+        [ "$dif" -lt "$meses" ] && continue
+      fi
+    fi
+    rclone purge "${remoto}/${nombre}" >/dev/null 2>&1 && log "[INFO] Retencion: eliminado $nombre"
+  done
+}
 
 FECHA="$(date +'%d-%B-%Y' | tr '[:upper:]' '[:lower:]')"
 HORA="$(date +'%H-%M')"
@@ -902,13 +1008,8 @@ else
 fi
 rm -rf "${TEMP_LOCAL:?}"/*
 
-if [ "${RETENCION_DIAS:-0}" -gt 0 ] 2>/dev/null; then
-  rclone delete "${RCLONE_REMOTE}:${DEST_PATH}" --min-age "${RETENCION_DIAS}d" \
-    --log-file="$RCLONE_LOG" --log-level INFO
-  rclone rmdirs "${RCLONE_REMOTE}:${DEST_PATH}" --leave-root \
-    --log-file="$RCLONE_LOG" --log-level INFO
-  log "[INFO] Retencion aplicada en Drive: mas de ${RETENCION_DIAS} dias"
-fi
+retencion_niveles_drive "${RCLONE_REMOTE}:${DEST_PATH}" "${RETENCION_DIAS:-0}" \
+  "${MENSUAL_CONSERVAR:-no}" "${MENSUAL_MESES:-0}"
 exit 0
 EOF
   chmod 750 "$2"
@@ -929,7 +1030,7 @@ crear_trabajo_red() {
   local SRV="" SMB_PORT="445" CIFS_USER="" CIFS_PASS="" CIFS_DOM="" SHARE="" SUB="" UNC=""
   local SMB_VERS="" MOUNT_POINT="" MOUNT_OPTS=""
   local BENCH_PATH="" SITE="" BACKUP_ORIGEN="" WITH_FILES=""
-  local RETENCION_DIAS="" HORARIOS="" DIAS_CRON=""
+  local RETENCION_DIAS="" MENSUAL_CONSERVAR="no" MENSUAL_MESES="0" HORARIOS="" DIAS_CRON=""
   local paso=1 estado NAV_ON=1 volver_resumen=0
 
   while :; do
@@ -1207,7 +1308,7 @@ red_paso_resumen() {
     say "   ${C_B}5${C_R}) Subcarpeta    : ${SUB:-(ninguna)}"
     say "   ${C_B}6${C_R}) Conexion      : ${UNC}   SMB ${SMB_VERS}   en ${MOUNT_POINT}"
     say "   ${C_B}7${C_R}) Sitio         : ${SITE}   adjuntos: ${WITH_FILES}"
-    say "   ${C_B}8${C_R}) Retencion     : ${RETENCION_DIAS} dias"
+    say "   ${C_B}8${C_R}) Retencion     : $(describir_retencion "$RETENCION_DIAS" "$MENSUAL_CONSERVAR" "$MENSUAL_MESES")"
     say "   ${C_B}9${C_R}) Programacion  : ${HORARIOS}  ($(describir_dias "$DIAS_CRON"))"
     echo
     say "   ${C_B}s${C_R}) Crear el trabajo con estos datos"
@@ -1248,6 +1349,7 @@ red_paso_resumen() {
     "SMB_VERS=${SMB_VERS}" "MOUNT_OPTS=${MOUNT_OPTS}" \
     "BENCH_PATH=${BENCH_PATH}" "SITE=${SITE}" "BACKUP_ORIGEN=${BACKUP_ORIGEN}" \
     "WITH_FILES=${WITH_FILES}" "RETENCION_DIAS=${RETENCION_DIAS}" \
+    "MENSUAL_CONSERVAR=${MENSUAL_CONSERVAR}" "MENSUAL_MESES=${MENSUAL_MESES}" \
     "HORARIOS=${HORARIOS}" "DIAS_CRON=${DIAS_CRON}" "LOG_FILE=${LOG_FILE}"
 
   generar_script_red "$CONF" "$SCRIPT"
@@ -1279,7 +1381,7 @@ crear_trabajo_drive() {
   local ETIQUETA="" JOB="" CONF="" SCRIPT="" LOG_FILE="" RCLONE_LOG=""
   local RCLONE_REMOTE="" DEST_PATH="" TEMP_LOCAL=""
   local BENCH_PATH="" SITE="" BACKUP_ORIGEN="" WITH_FILES="" BORRAR_ORIGEN="si"
-  local RETENCION_DIAS="" HORARIOS="" DIAS_CRON=""
+  local RETENCION_DIAS="" MENSUAL_CONSERVAR="no" MENSUAL_MESES="0" HORARIOS="" DIAS_CRON=""
   local paso=1 estado NAV_ON=1 volver_resumen=0
 
   while :; do
@@ -1428,7 +1530,7 @@ drv_paso_resumen() {
     say "   ${C_B}4${C_R}) Temporal      : ${TEMP_LOCAL}"
     say "   ${C_B}5${C_R}) Sitio         : ${SITE}   adjuntos: ${WITH_FILES}"
     say "   ${C_B}6${C_R}) Borrar local  : ${BORRAR_ORIGEN}"
-    say "   ${C_B}7${C_R}) Retencion     : ${RETENCION_DIAS} dias"
+    say "   ${C_B}7${C_R}) Retencion     : $(describir_retencion "$RETENCION_DIAS" "$MENSUAL_CONSERVAR" "$MENSUAL_MESES")"
     say "   ${C_B}8${C_R}) Programacion  : ${HORARIOS}  ($(describir_dias "$DIAS_CRON"))"
     echo
     say "   ${C_B}s${C_R}) Crear el trabajo con estos datos"
@@ -1453,6 +1555,7 @@ drv_paso_resumen() {
     "BENCH_PATH=${BENCH_PATH}" "SITE=${SITE}" "BACKUP_ORIGEN=${BACKUP_ORIGEN}" \
     "WITH_FILES=${WITH_FILES}" "BORRAR_ORIGEN=${BORRAR_ORIGEN}" \
     "RETENCION_DIAS=${RETENCION_DIAS}" \
+    "MENSUAL_CONSERVAR=${MENSUAL_CONSERVAR}" "MENSUAL_MESES=${MENSUAL_MESES}" \
     "HORARIOS=${HORARIOS}" "DIAS_CRON=${DIAS_CRON}" \
     "LOG_FILE=${LOG_FILE}" "RCLONE_LOG=${RCLONE_LOG}"
 
@@ -1570,7 +1673,8 @@ menu_trabajo() {
     else
       say "  Destino : ${RCLONE_REMOTE}:${DEST_PATH}"
     fi
-    say "  Sitio   : ${SITE}   adjuntos: ${WITH_FILES}   retencion: ${RETENCION_DIAS} dias"
+    say "  Sitio   : ${SITE}   adjuntos: ${WITH_FILES}"
+    say "  Retencion: $(describir_retencion "${RETENCION_DIAS:-0}" "${MENSUAL_CONSERVAR:-no}" "${MENSUAL_MESES:-0}")"
     say "  Horario : ${HORARIOS}   ($(describir_dias "$DIAS_CRON"))"
     echo
     say "   1) Ejecutar respaldo ahora"
@@ -1625,9 +1729,12 @@ menu_trabajo() {
            ok "Actualizado."
          fi; enter;;
       5) pantalla "TRABAJO '${ETIQUETA}'  >  Retencion"
-         pedir_retencion
-         set_conf "$conf" RETENCION_DIAS "$RETENCION_DIAS"
-         ok "Retencion actualizada a ${RETENCION_DIAS} dias."; enter;;
+         if pedir_retencion; then
+           set_conf "$conf" RETENCION_DIAS "$RETENCION_DIAS"
+           set_conf "$conf" MENSUAL_CONSERVAR "$MENSUAL_CONSERVAR"
+           set_conf "$conf" MENSUAL_MESES "$MENSUAL_MESES"
+           ok "Retencion: $(describir_retencion "$RETENCION_DIAS" "$MENSUAL_CONSERVAR" "$MENSUAL_MESES")"
+         fi; enter;;
       6) pantalla "TRABAJO '${ETIQUETA}'  >  Configuracion"
          sed 's/^/    /' "$conf"; echo
          say "  ${C_B}Cron activo:${C_R}"; cron_mostrar "$JOB_NOMBRE"; echo
