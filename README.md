@@ -1,4 +1,4 @@
-# frappe-backup# iZone Enterprise · Backups
+# iZone Enterprise · Backups
 
 Gestor por menú para automatizar los respaldos de **Frappe / ERPNext** y enviarlos a **unidades de red (CIFS/SMB)** y a **Google Drive**, con horarios propios por destino, diagnóstico integrado y edición posterior sin reinstalar.
 
@@ -242,12 +242,6 @@ Los paquetes que falten (`cifs-utils`, `rsync`, `smbclient`, `rclone`) los insta
 - En un NAS Synology la ruta CIFS **no incluye** el volumen interno (`volume1`). Si DSM muestra `/volume1/Informatica/backup-aca`, la conexión correcta es `//IP/Informatica/backup-aca`.
 - El permiso debe estar a nivel de **carpeta compartida**, no solo de la subcarpeta: es la causa más común del `mount error(13)`.
 - SMB viaja por el puerto **445**. El 5001 de Synology es la interfaz web DSM y no sirve para archivos compartidos.
-
----
-
-## Documentación
-
-- [`docs/CONTEXTO.md`](docs/CONTEXTO.md) — arquitectura, decisiones de diseño, problemas resueltos con su causa, entorno y pendientes.
 
 ---
 
