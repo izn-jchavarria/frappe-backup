@@ -105,7 +105,7 @@ Al corregir un dato se vuelve directo a esta pantalla, sin repetir el resto del 
 
 ---
 
-## Trabajo hacia una Unidad de Red (CIFS)
+## Trabajo hacia una Unidad de Red (CIFS o rclone)
 
 Solo se piden cuatro datos: **dirección del servidor**, **usuario**, **contraseña** y **dominio** (`WORKGROUP` si la red no tiene Active Directory). El resto lo averigua el asistente:
 
@@ -116,6 +116,26 @@ Solo se piden cuatro datos: **dirección del servidor**, **usuario**, **contrase
 5. **Qué se respalda y cuándo** — bench, sitio, adjuntos, retención y horarios
 
 Al confirmar escribe `/etc/fstab`, monta y verifica escritura real en el destino. El respaldo se deposita como `<montaje>/<fecha>/<hora>/` y el origen local se libera solo si la copia terminó correctamente.
+
+### Cuando el servidor no puede montar: rclone sin montaje
+
+Un contenedor LXC sin privilegios (habitual en Proxmox) no puede montar carpetas de red: `mount` responde `error(1): Operation not permitted` aunque usuario, contraseña y ruta estén bien. El asistente lo detecta solo y usa el **segundo camino**: rclone habla SMB directo con el NAS, sin montar nada y sin tocar `/etc/fstab`.
+
+- **Cómo decide** — si el equipo es un contenedor sin privilegios, ni intenta montar. Si no lo es, prueba CIFS; solo si el montaje falla con `error(1)` pasa a rclone. Los errores de credenciales, ruta o red se siguen reportando como tales, porque rclone fallaría igual
+- **Prueba antes de crear el trabajo** — escribe un archivo de 1 MB en el NAS, lo renombra, lo relee, compara su huella y lo borra. Si algo no sale perfecto, el trabajo no se crea
+- **rclone con SMB** — hace falta la v1.60 o mayor. Si el del sistema es más viejo, ofrece descargar el rclone oficial **solo para estos trabajos** en `/usr/local/lib/izone-backup/rclone`, comprobando su huella SHA256. El rclone del sistema, que usan los trabajos de Drive, no se toca
+- **La contraseña** sigue solo en el `.cred`; no se escribe en la configuración de rclone, así que el NAS no aparece entre las cuentas de Drive
+
+Cada respaldo por este camino:
+
+1. Comprueba antes de empezar que el NAS responda y que haya espacio en el servidor y en el NAS, dejando una reserva libre para que el servidor siga funcionando. Si algo falta, `bench` ni se ejecuta
+2. Ejecuta `bench backup` con prioridad baja, con el sitio en línea, en una carpeta propia del trabajo (`--backup-path`) para no mezclarse con otros trabajos
+3. Verifica el volcado completo (siempre; aquí no se puede aligerar ni desactivar) y genera `SHA256SUMS`
+4. Lo envía a `<fecha>/<hora>.subiendo.<trabajo>`, lo **relee desde el NAS byte a byte** y, si no coincide, borra lo enviado y reintenta una vez
+5. Solo entonces lo renombra a `<fecha>/<hora>`. En el NAS nunca queda un respaldo a medias con nombre normal; los envíos interrumpidos se limpian en la siguiente ejecución
+6. Libera la copia local y aplica la retención. Si algo falló, el respaldo verificado se conserva en la carpeta local (solo el más reciente, para no llenar el disco)
+
+Dos ejecuciones del mismo trabajo no se cruzan: si una sigue en curso, la otra no corre.
 
 ---
 
@@ -142,7 +162,8 @@ Al elegir un trabajo de la lista se puede, sin reinstalar nada:
 - Cambiar qué se respalda (bench, sitio, adjuntos)
 - Cambiar la retención
 - Ver la configuración, el cron generado y el log
-- En trabajos de red: actualizar credenciales y montar en el momento
+- En trabajos de red: actualizar credenciales y montar en el momento (o, por rclone, probar la conexión)
+- Comprobar un respaldo ya guardado: relee cada archivo desde el destino y lo compara con su `SHA256SUMS`
 - Eliminar el trabajo, limpiando cron, `/etc/fstab` y credenciales
 
 ---
@@ -200,6 +221,7 @@ Con `--with-files` se incluyen además los archivos adjuntos (los PDF de una fac
 Recorre todos los trabajos, uno por pantalla:
 
 - Montaje CIFS activo y **prueba real de escritura** en el destino
+- En red por rclone: versión de rclone, acceso al NAS, envíos a medias y espacio en la carpeta local
 - Cuenta de rclone registrada y acceso a la carpeta destino
 - Entradas de cron activas, estado del servicio y últimas líneas del log
 - Entorno Frappe: bench, entorno virtual, sitio y carpeta de backups
@@ -216,7 +238,8 @@ Los archivos de cada trabajo se nombran como `<hostname>-backup-<etiqueta>`, com
 | Configuración | `/etc/izone-backup/aip-srv-acct-backup-nas-contabilidad.conf` |
 | Credenciales (solo red) | `/etc/izone-backup/aip-srv-acct-backup-nas-contabilidad.cred` |
 | Log | `/var/log/izone-backup/aip-srv-acct-backup-nas-contabilidad.log` |
-| Punto de montaje (solo red) | `/mnt/aip-srv-acct-backup-nas-contabilidad` |
+| Punto de montaje (solo red por CIFS) | `/mnt/aip-srv-acct-backup-nas-contabilidad` |
+| Carpeta local de trabajo (solo red por rclone) | `/var/tmp/izone-backup/aip-srv-acct-backup-nas-contabilidad` |
 
 Los scripts de respaldo **leen su `.conf` en tiempo de ejecución**: cualquier cambio hecho desde el menú aplica de inmediato sin regenerar nada.
 
@@ -227,7 +250,7 @@ Los scripts de respaldo **leen su `.conf` en tiempo de ejecución**: cualquier c
 - Ubuntu / Debian con `systemd` y `cron`
 - Acceso `root` (`sudo`)
 - Un bench de Frappe/ERPNext funcional en el servidor
-- Para unidad de red: recurso SMB accesible desde **el servidor** y un usuario **del servidor de archivos** con permiso de lectura y escritura sobre la carpeta compartida
+- Para unidad de red: recurso SMB accesible desde **el servidor** y un usuario **del servidor de archivos** con permiso de lectura y escritura sobre la carpeta compartida. En contenedores sin privilegios, rclone v1.60 o mayor (el gestor ofrece instalar su propia copia)
 - Para Google Drive: una computadora con navegador y rclone, solo la primera vez, para generar el token
 
 Los paquetes que falten (`cifs-utils`, `rsync`, `smbclient`, `rclone`) los instala el propio gestor.
@@ -242,6 +265,8 @@ Los paquetes que falten (`cifs-utils`, `rsync`, `smbclient`, `rclone`) los insta
 - En un NAS Synology la ruta CIFS **no incluye** el volumen interno (`volume1`). Si DSM muestra `/volume1/Informatica/backup-aca`, la conexión correcta es `//IP/Informatica/backup-aca`.
 - El permiso debe estar a nivel de **carpeta compartida**, no solo de la subcarpeta: es la causa más común del `mount error(13)`.
 - SMB viaja por el puerto **445**. El 5001 de Synology es la interfaz web DSM y no sirve para archivos compartidos.
+- `mount error(1): Operation not permitted` no es un problema de credenciales: el sistema no permite montar (contenedor sin privilegios). El asistente usa rclone en ese caso.
+- Actualizar el gestor no reescribe los scripts de los trabajos existentes salvo que cambie su código generado; cuando lo hace, cada script se reemplaza de una sola vez, sin cortar un respaldo que esté corriendo.
 
 ---
 
