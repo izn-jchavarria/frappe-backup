@@ -3,7 +3,12 @@
 #  iZONE ENTERPRISE - BACKUPS
 #  Gestor de respaldos para Frappe / ERPNext
 #  Destinos soportados: Unidad de Red (CIFS) y Google Drive (rclone)
-#  Version: 2.3.0
+#  Version: 2.4.0
+#
+#  Un respaldo que no se puede restaurar no es un respaldo. Desde la 2.4.0
+#  cada ejecucion comprueba que el volcado se pueda abrir y este completo
+#  ANTES de copiarlo, ANTES de borrar el original y ANTES de aplicar la
+#  retencion. Si la verificacion falla no se borra ni se elimina nada.
 #
 #  Uso:  sudo ./izone-backup-manager.sh
 # =====================================================================
@@ -17,6 +22,7 @@ HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"
 BASE="${HOST_SHORT}-backup"
 RCLONE_ESPERA=150
 NAV_ON=0          # 1 dentro de los asistentes: habilita v=volver, x=cancelar
+GEN_VERSION_ACTUAL="2.4.0"   # version del codigo que se escribe en los scripts
 
 C_R=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
 C_CY=$'\033[0;36m'; C_GR=$'\033[0;32m'; C_RD=$'\033[0;31m'; C_YL=$'\033[0;33m'
@@ -237,7 +243,7 @@ cargar_conf() {
   unset JOB_TIPO JOB_NOMBRE ETIQUETA SERVIDOR RECURSO SUBCARPETA UNC MOUNT_POINT CRED_FILE \
         SMB_VERS MOUNT_OPTS RCLONE_REMOTE DEST_PATH RCLONE_CONFIG TEMP_LOCAL BENCH_PATH \
         SITE BACKUP_ORIGEN WITH_FILES BORRAR_ORIGEN RETENCION_DIAS HORARIOS DIAS_CRON SMB_PORT \
-        MENSUAL_CONSERVAR MENSUAL_MESES \
+        MENSUAL_CONSERVAR MENSUAL_MESES VERIFICAR VERIFICAR_DESTINO ESTADO_FILE GEN_VERSION \
         LOG_FILE RCLONE_LOG 2>/dev/null
   # shellcheck disable=SC1090
   . "$1"
@@ -387,6 +393,8 @@ pedir_frappe() {
   [ -d "$BACKUP_ORIGEN" ] || warn "Aun no existe ${BACKUP_ORIGEN} (se creara con el primer backup)."
   si_no_nav "Incluir archivos adjuntos en el respaldo (--with-files)?"; local n=$?
   case "$n" in 0) WITH_FILES="si";; 1) WITH_FILES="no";; *) return "$n";; esac
+  pedir_verificacion || return $?
+  [ "${VERIFICAR:-si}" = "no" ] || pedir_verificacion_destino || return $?
   return 0
 }
 
@@ -432,6 +440,177 @@ describir_retencion() {   # describir_retencion <dias> <si/no> <meses>
   else
     echo "${1} dias"
   fi
+}
+
+# ====================== VERIFICACION Y ESTADO ========================
+pedir_verificacion() {
+  local o
+  echo
+  say "  ${C_B}Verificacion del respaldo${C_R}"
+  say "  ${C_DIM}Antes de dar un respaldo por bueno se comprueba que se pueda abrir y${C_R}"
+  say "  ${C_DIM}que el volcado no haya quedado a la mitad. Si la comprobacion falla,${C_R}"
+  say "  ${C_DIM}el respaldo local NO se borra, NO se copia al destino y la retencion${C_R}"
+  say "  ${C_DIM}NO se aplica: nunca se pierde un respaldo bueno por uno danado.${C_R}"
+  echo
+  say "   1) Completa ${C_DIM}(recomendada)${C_R}"
+  say "      ${C_DIM}Revisa el volcado de la base y tambien los archivos adjuntos.${C_R}"
+  say "   2) Rapida"
+  say "      ${C_DIM}Igual de estricta con el volcado. En adjuntos de mas de 2 GB solo${C_R}"
+  say "      ${C_DIM}comprueba el cierre del archivo. Util si el respaldo es enorme.${C_R}"
+  say "   3) Sin verificacion"
+  say "      ${C_DIM}Vuelve al comportamiento anterior. No recomendada.${C_R}"
+  echo
+  while true; do
+    read -rp "  Verificacion [1]: " o || fin_entrada
+    o="${o:-1}"
+    _nav_check "$o"; local n=$?
+    [ "$n" -ne 0 ] && return "$n"
+    case "$o" in
+      1) VERIFICAR="si";     return 0;;
+      2) VERIFICAR="rapida"; return 0;;
+      3) if si_no "Seguro? Un respaldo danado no avisaria a nadie."; then
+           VERIFICAR="no"; return 0
+         fi;;
+      *) err "Opcion invalida.";;
+    esac
+  done
+}
+
+describir_verificacion() {
+  case "${1:-si}" in
+    si)     echo "completa";;
+    rapida) echo "rapida";;
+    no)     echo "DESACTIVADA";;
+    *)      echo "${1}";;
+  esac
+}
+
+# Cuanta certeza se exige sobre la copia que quedo en el destino, antes
+# de borrar el respaldo local. Las opciones dependen del tipo de trabajo.
+pedir_verificacion_destino() {
+  local o tipo="${TIPO_TRABAJO:-red}"
+  echo
+  say "  ${C_B}Comprobacion de la copia en el destino${C_R}"
+  say "  ${C_DIM}El respaldo local solo se borra cuando esta comprobacion pasa.${C_R}"
+  echo
+  if [ "$tipo" = "drive" ]; then
+    say "   1) Por huella ${C_DIM}(recomendada)${C_R}"
+    say "      ${C_DIM}Compara la huella MD5 que reporta Google contra la del archivo${C_R}"
+    say "      ${C_DIM}local. Detecta cualquier diferencia de contenido, incluso si el${C_R}"
+    say "      ${C_DIM}archivo danado pesa exactamente lo mismo. No descarga nada.${C_R}"
+    say "      ${C_DIM}Si Google no devuelve la huella de algun archivo, se da por${C_R}"
+    say "      ${C_DIM}fallido: comparar solo tamanos no prueba nada.${C_R}"
+    say "   2) Descargando de vuelta"
+    say "      ${C_DIM}Baja el respaldo desde Drive y lo compara byte a byte. Certeza${C_R}"
+    say "      ${C_DIM}maxima y ademas prueba que se puede descargar. Consume el mismo${C_R}"
+    say "      ${C_DIM}trafico que la subida, en cada respaldo.${C_R}"
+  else
+    say "   1) Basica ${C_DIM}(recomendada)${C_R}"
+    say "      ${C_DIM}rsync ya comprueba cada archivo con checksum mientras copia;${C_R}"
+    say "      ${C_DIM}ademas se confirma archivo por archivo que llego completo.${C_R}"
+    say "   2) Completa"
+    say "      ${C_DIM}Vuelve a leer el respaldo entero desde el NAS y recalcula las${C_R}"
+    say "      ${C_DIM}huellas. Lo mas seguro, pero lee todo el respaldo por la red${C_R}"
+    say "      ${C_DIM}en cada ejecucion.${C_R}"
+  fi
+  echo
+  while true; do
+    read -rp "  Comprobacion del destino [1]: " o || fin_entrada
+    o="${o:-1}"
+    _nav_check "$o"; local n=$?
+    [ "$n" -ne 0 ] && return "$n"
+    case "$o" in
+      1) [ "$tipo" = "drive" ] && VERIFICAR_DESTINO="hash" || VERIFICAR_DESTINO="basico"
+         return 0;;
+      2) [ "$tipo" = "drive" ] && VERIFICAR_DESTINO="descarga" || VERIFICAR_DESTINO="completo"
+         return 0;;
+      *) err "Opcion invalida.";;
+    esac
+  done
+}
+
+describir_verificacion_destino() {
+  case "${1:-}" in
+    hash)     echo "huella MD5 de Google";;
+    descarga) echo "descargando y comparando";;
+    basico)   echo "basica";;
+    completo) echo "relectura completa";;
+    *)        echo "basica";;
+  esac
+}
+
+# Los scripts de respaldo dejan el resultado de cada ejecucion en
+# <trabajo>.estado. Aqui se lee para poder mostrarlo en los menus.
+estado_leer() {   # estado_leer <archivo .estado>
+  EST_ESTADO=""; EST_CODIGO=""; EST_DETALLE=""
+  EST_FIN=""; EST_OK=""; EST_BYTES=""; EST_DESTINO=""
+  [ -r "$1" ] || return 1
+  local l k v
+  while IFS= read -r l; do
+    k="${l%%=*}"; v="${l#*=}"
+    case "$k" in
+      ULTIMO_ESTADO)  EST_ESTADO="$v";;
+      ULTIMO_CODIGO)  EST_CODIGO="$v";;
+      ULTIMO_DETALLE) EST_DETALLE="$v";;
+      ULTIMO_FIN)     EST_FIN="$v";;
+      ULTIMO_OK)      EST_OK="$v";;
+      ULTIMO_BYTES)   EST_BYTES="$v";;
+      ULTIMO_DESTINO) EST_DESTINO="$v";;
+    esac
+  done < "$1"
+  return 0
+}
+
+# Ruta del archivo de estado a partir de la del .conf
+estado_archivo() { printf '%s' "${1%.conf}.estado"; }
+
+# Una linea con el resultado del ultimo respaldo, en color.
+estado_resumen() {   # estado_resumen <archivo .conf>
+  local e; e="$(estado_archivo "$1")"
+  if ! estado_leer "$e"; then
+    printf '%b' "${C_DIM}sin ejecutar todavia${C_R}"; return 0
+  fi
+  case "$EST_ESTADO" in
+    OK)    printf '%b' "${C_GR}ultimo respaldo correcto${C_R} ${C_DIM}(${EST_FIN})${C_R}";;
+    AVISO) printf '%b' "${C_YL}ultimo respaldo con aviso${C_R} ${C_DIM}(${EST_FIN})${C_R}";;
+    FALLO) printf '%b' "${C_RD}${C_B}ULTIMO RESPALDO FALLIDO${C_R} ${C_DIM}(${EST_FIN})${C_R}";;
+    *)     printf '%b' "${C_DIM}${EST_ESTADO:-sin datos}${C_R}";;
+  esac
+}
+
+# Cuantos trabajos tienen el ultimo respaldo fallido.
+trabajos_fallidos() {
+  local c e n=0
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    e="$(estado_archivo "$c")"
+    [ -r "$e" ] && grep -q '^ULTIMO_ESTADO=FALLO' "$e" && n=$((n+1))
+  done < <(listar_confs)
+  printf '%s' "$n"
+}
+
+# Bloque completo del estado, para el diagnostico y el menu del trabajo.
+estado_detalle() {   # estado_detalle <archivo .conf>
+  local e; e="$(estado_archivo "$1")"
+  say "  ${C_B}Ultima ejecucion${C_R}"
+  if ! estado_leer "$e"; then
+    warn "todavia no se ha ejecutado ningun respaldo"
+    return 0
+  fi
+  case "$EST_ESTADO" in
+    OK)    ok   "resultado: correcto  (${EST_FIN})";;
+    AVISO) warn "resultado: correcto con avisos  (${EST_FIN})";;
+    FALLO) err  "resultado: FALLIDO  (${EST_FIN})  codigo ${EST_CODIGO}";;
+    *)     warn "resultado: ${EST_ESTADO}";;
+  esac
+  [ -n "$EST_DETALLE" ] && say "    ${C_DIM}${EST_DETALLE}${C_R}"
+  if [ -n "$EST_OK" ]; then
+    say "    ${C_DIM}ultimo respaldo bueno: ${EST_OK}${C_R}"
+  else
+    say "    ${C_RD}aun no hay ningun respaldo bueno registrado${C_R}"
+  fi
+  [ -n "$EST_DESTINO" ] && say "    ${C_DIM}quedo en: ${EST_DESTINO}${C_R}"
+  return 0
 }
 
 # ========================= AYUDAS DE RED =============================
@@ -844,6 +1023,10 @@ generar_script_red() {
 #!/usr/bin/env bash
 # Generado por iZone ENTERPRISE - BACKUPS  -  destino: Unidad de Red (CIFS)
 # La configuracion vive en el .conf; no edite valores aqui.
+#
+# Codigos de salida:
+#   0 correcto   1 entorno o rutas   2 fallo 'bench backup'
+#   3 fallo la copia   5 bench no dejo archivos   6 respaldo danado
 CONF="$1"
 EOF
   cat >> "$2" <<'EOF'
@@ -852,7 +1035,158 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 [ -r "$CONF" ] || { echo "[ERROR] No se encuentra la configuracion: $CONF"; exit 1; }
 # shellcheck disable=SC1090
 . "$CONF"
+
+# ---------------------------------------------------------------------
+#  Registro y estado
+# ---------------------------------------------------------------------
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+ULTIMO_BYTES_NUEVO=""
+
+# Lee una clave del archivo de estado de este trabajo.
+estado_valor() {   # estado_valor <CLAVE>
+  [ -n "${ESTADO_FILE:-}" ] && [ -r "$ESTADO_FILE" ] || return 0
+  sed -n "s/^$1=//p" "$ESTADO_FILE" | tail -n 1
+}
+
+# Deja constancia de como termino esta ejecucion. ULTIMO_OK solo se mueve
+# cuando el respaldo fue bueno, asi que siempre se puede responder
+# "cuando fue la ultima vez que hubo un respaldo sano".
+estado_escribir() {   # estado_escribir <OK|AVISO|FALLO> <codigo> <detalle> [destino]
+  [ -n "${ESTADO_FILE:-}" ] || return 0
+  local ok_previo bytes_previo ahora
+  ahora="$(date '+%Y-%m-%d %H:%M:%S')"
+  ok_previo="$(estado_valor ULTIMO_OK)"
+  bytes_previo="$(estado_valor ULTIMO_BYTES)"
+  [ "$1" = "OK" ] && ok_previo="$ahora"
+  [ "$1" != "FALLO" ] && [ -n "$ULTIMO_BYTES_NUEVO" ] && bytes_previo="$ULTIMO_BYTES_NUEVO"
+  mkdir -p "$(dirname "$ESTADO_FILE")" 2>/dev/null
+  {
+    echo "ULTIMO_ESTADO=$1"
+    echo "ULTIMO_CODIGO=$2"
+    echo "ULTIMO_DETALLE=$3"
+    echo "ULTIMO_FIN=$ahora"
+    echo "ULTIMO_OK=$ok_previo"
+    echo "ULTIMO_BYTES=$bytes_previo"
+    echo "ULTIMO_DESTINO=${4:-}"
+  } > "$ESTADO_FILE" 2>/dev/null
+  chmod 640 "$ESTADO_FILE" 2>/dev/null
+  return 0
+}
+
+# Unica salida del script: siempre deja escrito el estado.
+salir() {   # salir <codigo> <OK|AVISO|FALLO> <detalle> [destino]
+  estado_escribir "$2" "$1" "$3" "${4:-}"
+  case "$2" in
+    OK)    log "[OK] $3";;
+    AVISO) log "[AVISO] $3";;
+    *)     log "[ERROR] $3";;
+  esac
+  exit "$1"
+}
+
+# Suma en bytes de los archivos regulares de una carpeta. Se usa find y no
+# 'du' porque el tamano que du atribuye a los directorios cambia entre un
+# disco local y un recurso CIFS, y eso daria diferencias falsas.
+bytes_de() { find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
+
+# ---------------------------------------------------------------------
+#  Verificacion del respaldo recien creado
+#  Devuelve 0 correcto - 1 danado - 2 correcto pero con avisos
+# ---------------------------------------------------------------------
+verificar_respaldo() {   # verificar_respaldo <carpeta> <si|rapida|no>
+  local dir="$1" nivel="${2:-si}" f tam hay_sql=0 aviso=0 previo ahora_b
+
+  if [ "$nivel" = "no" ]; then
+    log "[AVISO] La verificacion esta desactivada para este trabajo."
+    ULTIMO_BYTES_NUEVO="$(bytes_de "$dir")"
+    return 0
+  fi
+
+  # 1. El volcado de la base de datos es obligatorio: sin el, no hay respaldo.
+  for f in "$dir"/*.sql.gz; do
+    [ -e "$f" ] || continue
+    hay_sql=1
+    tam="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
+    if [ "$tam" -lt 10240 ]; then
+      log "[ERROR] Verificacion: $(basename "$f") pesa solo ${tam} bytes."
+      return 1
+    fi
+    # 1a. El contenedor gzip esta completo.
+    if ! gzip -t "$f" 2>/dev/null; then
+      log "[ERROR] Verificacion: $(basename "$f") esta corrupto (gzip no puede abrirlo)."
+      return 1
+    fi
+    # 1b. Y el volcado llega hasta el final. Esto es lo que de verdad importa:
+    #     si mysqldump muere a la mitad, gzip recibe fin de entrada y cierra
+    #     un archivo .gz perfectamente valido que contiene un SQL incompleto.
+    #     El unico rastro es que falte la marca de cierre.
+    if ! gzip -dc "$f" 2>/dev/null | tail -c 4000 \
+         | grep -qE -- "-- Dump completed|UNLOCK TABLES;|^COMMIT;"; then
+      log "[ERROR] Verificacion: $(basename "$f") termina a la mitad."
+      log "        El volcado quedo incompleto; no sirve para restaurar."
+      return 1
+    fi
+  done
+  if [ "$hay_sql" -eq 0 ]; then
+    log "[ERROR] Verificacion: no hay ningun volcado .sql.gz en $dir"
+    return 1
+  fi
+
+  # 2. Los archivos adjuntos, si se incluyeron.
+  for f in "$dir"/*.tar; do
+    [ -e "$f" ] || continue
+    tam="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
+    if [ "$nivel" = "rapida" ] && [ "$tam" -gt 2147483648 ]; then
+      # En modo rapido, sobre un tar enorme se comprueba solo el cierre
+      # (un tar termina en bloques de ceros) en vez de recorrerlo entero.
+      if [ "$(tail -c 1024 "$f" 2>/dev/null | tr -d '\0' | wc -c)" -ne 0 ]; then
+        log "[ERROR] Verificacion: $(basename "$f") no termina correctamente (truncado)."
+        return 1
+      fi
+    else
+      if ! tar -tf "$f" >/dev/null 2>&1; then
+        log "[ERROR] Verificacion: $(basename "$f") esta corrupto (tar no puede leerlo)."
+        return 1
+      fi
+    fi
+  done
+
+  # 3. La configuracion del sitio que acompana al respaldo.
+  for f in "$dir"/*.json; do
+    [ -e "$f" ] || continue
+    [ -s "$f" ] || { log "[ERROR] Verificacion: $(basename "$f") esta vacio."; return 1; }
+  done
+
+  # 4. Comparacion con el ultimo respaldo bueno. No invalida nada: avisa.
+  #    Un respaldo que de pronto pesa la mitad suele significar que se
+  #    perdieron datos en origen, no que la copia fallara.
+  ahora_b="$(bytes_de "$dir")"
+  ULTIMO_BYTES_NUEVO="$ahora_b"
+  previo="$(estado_valor ULTIMO_BYTES)"
+  if [ -n "$previo" ] && [ "$previo" -gt 0 ] 2>/dev/null; then
+    if [ "$((ahora_b * 2))" -lt "$previo" ]; then
+      log "[AVISO] Este respaldo pesa ${ahora_b} bytes; el anterior pesaba ${previo}."
+      log "        Menos de la mitad. Revise que no se hayan perdido datos en el sitio."
+      aviso=1
+    fi
+  fi
+
+  log "[OK] Verificacion superada: el respaldo se puede abrir y esta completo."
+  [ "$aviso" -eq 1 ] && return 2
+  return 0
+}
+
+# Huella de cada archivo, para poder comprobar el respaldo el dia de la
+# restauracion con:  sha256sum -c SHA256SUMS
+escribir_huellas() {   # escribir_huellas <carpeta>
+  ( cd "$1" 2>/dev/null || exit 0
+    : > SHA256SUMS
+    for f in *; do
+      [ -f "$f" ] && [ "$f" != "SHA256SUMS" ] && sha256sum "$f" >> SHA256SUMS
+    done ) 2>/dev/null
+  return 0
+}
 
 # Retencion por niveles sobre carpetas <base>/<dd-mes-aaaa>
 retencion_niveles_local() {
@@ -897,31 +1231,102 @@ FECHA="$(date +'%d-%B-%Y' | tr '[:upper:]' '[:lower:]')"
 HORA="$(date +'%H-%M')"
 DESTINO_FINAL="${MOUNT_POINT}/${FECHA}/${HORA}"
 
+log "[INFO] Inicio del respaldo de '${SITE}' hacia ${MOUNT_POINT}"
+
+# ---- 1. El destino tiene que estar montado ---------------------------
 if ! mountpoint -q "$MOUNT_POINT"; then
   log "[AVISO] $MOUNT_POINT no esta montado. Intentando montar..."
   mount "$MOUNT_POINT" >/dev/null 2>&1
 fi
-mountpoint -q "$MOUNT_POINT" || { log "[ERROR] $MOUNT_POINT no esta montado. Abortando."; exit 1; }
+mountpoint -q "$MOUNT_POINT" || \
+  salir 1 FALLO "$MOUNT_POINT no esta montado. No se creo ningun respaldo."
 
-mkdir -p "$DESTINO_FINAL" || { log "[ERROR] No se pudo crear $DESTINO_FINAL"; exit 1; }
-
-cd "$BENCH_PATH" || { log "[ERROR] No existe $BENCH_PATH"; exit 1; }
+# ---- 2. Crear el respaldo -------------------------------------------
+cd "$BENCH_PATH" || salir 1 FALLO "No existe el bench: $BENCH_PATH"
 # shellcheck disable=SC1091
 . env/bin/activate
 BENCH_ARGS=(--site "$SITE" backup)
 [ "${WITH_FILES:-si}" = "si" ] && BENCH_ARGS+=(--with-files)
-bench "${BENCH_ARGS[@]}" >/dev/null 2>&1 || { log "[ERROR] 'bench backup' fallo para $SITE"; exit 2; }
+# La salida de bench se guarda: si falla, es lo unico que explica por que.
+SALIDA_BENCH="$(bench "${BENCH_ARGS[@]}" 2>&1)" || {
+  printf '%s\n' "$SALIDA_BENCH" | tail -n 15
+  salir 2 FALLO "'bench backup' fallo para $SITE"
+}
 
-if rsync -a --remove-source-files "${BACKUP_ORIGEN}/" "${DESTINO_FINAL}/"; then
-  log "[OK] Respaldo completado en $DESTINO_FINAL"
-else
-  log "[ERROR] Fallo la copia hacia $DESTINO_FINAL"; exit 3
+# Que bench devuelva 0 no garantiza que dejara archivos.
+if [ ! -d "$BACKUP_ORIGEN" ] || [ -z "$(ls -A "$BACKUP_ORIGEN" 2>/dev/null)" ]; then
+  salir 5 FALLO "bench no dejo ningun archivo en $BACKUP_ORIGEN"
 fi
+
+# ---- 3. Verificar ANTES de copiar y ANTES de borrar nada -------------
+verificar_respaldo "$BACKUP_ORIGEN" "${VERIFICAR:-si}"; VERIF=$?
+if [ "$VERIF" -eq 1 ]; then
+  salir 6 FALLO "El respaldo recien creado esta danado. Se conserva en ${BACKUP_ORIGEN} y no se toco el destino ni la retencion."
+fi
+[ "${VERIFICAR:-si}" = "no" ] || escribir_huellas "$BACKUP_ORIGEN"
+
+# ---- 4. Copiar (rsync verifica cada archivo con checksum) ------------
+mkdir -p "$DESTINO_FINAL" || salir 1 FALLO "No se pudo crear $DESTINO_FINAL"
+rsync -a "${BACKUP_ORIGEN}/" "${DESTINO_FINAL}/" || \
+  salir 3 FALLO "Fallo la copia hacia $DESTINO_FINAL" "$DESTINO_FINAL"
+
+# ---- 5. Confirmar que llego todo ------------------------------------
+# Se comparan uno por uno los archivos que acabamos de copiar, en vez de
+# los totales de la carpeta: si por lo que fuera ya hubiera algo en el
+# destino -dos respaldos en el mismo minuto, restos de una corrida
+# anterior- un conteo global daria un fallo falso, y una alarma falsa
+# termina haciendo que nadie mire las alarmas.
+FALTAN=0; N_COP=0; B_COP=0
+while IFS= read -r ARCH; do
+  REL="${ARCH#"$BACKUP_ORIGEN"/}"
+  COPIA="${DESTINO_FINAL}/${REL}"
+  if [ ! -f "$COPIA" ]; then
+    log "[ERROR] No llego al destino: ${REL}"
+    FALTAN=$((FALTAN+1)); continue
+  fi
+  T_ORI="$(stat -c '%s' "$ARCH"  2>/dev/null || echo -1)"
+  T_DES="$(stat -c '%s' "$COPIA" 2>/dev/null || echo -2)"
+  if [ "$T_ORI" != "$T_DES" ]; then
+    log "[ERROR] Llego incompleto: ${REL} (${T_ORI} bytes en origen, ${T_DES} en destino)"
+    FALTAN=$((FALTAN+1)); continue
+  fi
+  N_COP=$((N_COP+1)); B_COP=$((B_COP+T_ORI))
+done < <(find "$BACKUP_ORIGEN" -type f 2>/dev/null)
+
+if [ "$FALTAN" -gt 0 ]; then
+  salir 3 FALLO "${FALTAN} archivo(s) no llegaron bien a ${DESTINO_FINAL}. No se borro nada del origen." "$DESTINO_FINAL"
+fi
+if [ "$N_COP" -eq 0 ]; then
+  salir 3 FALLO "No se copio ningun archivo a ${DESTINO_FINAL}." "$DESTINO_FINAL"
+fi
+log "[OK] Respaldo copiado en $DESTINO_FINAL (${N_COP} archivos, ${B_COP} bytes)"
+
+# ---- 5b. Comprobacion profunda: releer desde el destino --------------
+# rsync ya comprobo cada archivo con checksum al transferirlo. Esto va un
+# paso mas alla: vuelve a LEER el respaldo desde el recurso de red y
+# recalcula las huellas. Cuesta leer el respaldo entero por la red, por
+# eso es opcional.
+if [ "${VERIFICAR_DESTINO:-basico}" = "completo" ] && [ -f "${DESTINO_FINAL}/SHA256SUMS" ]; then
+  log "[INFO] Releyendo el respaldo desde el destino para comprobar las huellas..."
+  if ( cd "$DESTINO_FINAL" && sha256sum -c SHA256SUMS ) >/dev/null 2>&1; then
+    log "[OK] Las huellas coinciden leyendo desde el destino."
+  else
+    salir 3 FALLO "Al releer desde ${DESTINO_FINAL} las huellas no coinciden. No se borro nada del origen." "$DESTINO_FINAL"
+  fi
+fi
+
+# ---- 6. Recien ahora se libera el disco local ------------------------
+find "$BACKUP_ORIGEN" -mindepth 1 -type f -delete 2>/dev/null
 find "$BACKUP_ORIGEN" -mindepth 1 -type d -empty -delete 2>/dev/null
 
+# ---- 7. Retencion: solo despues de un respaldo bueno -----------------
 retencion_niveles_local "$MOUNT_POINT" "${RETENCION_DIAS:-0}" \
   "${MENSUAL_CONSERVAR:-no}" "${MENSUAL_MESES:-0}"
-exit 0
+
+if [ "$VERIF" -eq 2 ]; then
+  salir 0 AVISO "Respaldo correcto en ${DESTINO_FINAL}, pero mucho mas pequeno que el anterior." "$DESTINO_FINAL"
+fi
+salir 0 OK "Respaldo verificado en ${DESTINO_FINAL}" "$DESTINO_FINAL"
 EOF
   chmod 750 "$2"
 }
@@ -931,6 +1336,11 @@ generar_script_drive() {
 #!/usr/bin/env bash
 # Generado por iZone ENTERPRISE - BACKUPS  -  destino: Google Drive (rclone)
 # La configuracion vive en el .conf; no edite valores aqui.
+#
+# Codigos de salida:
+#   0 correcto   1 entorno o rutas   2 fallo 'bench backup'
+#   3 fallo la copia local   4 fallo la subida o la verificacion en Drive
+#   5 bench no dejo archivos   6 respaldo danado
 CONF="$1"
 EOF
   cat >> "$2" <<'EOF'
@@ -940,7 +1350,158 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 # shellcheck disable=SC1090
 . "$CONF"
 export RCLONE_CONFIG="${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}"
+
+# ---------------------------------------------------------------------
+#  Registro y estado
+# ---------------------------------------------------------------------
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+ULTIMO_BYTES_NUEVO=""
+
+# Lee una clave del archivo de estado de este trabajo.
+estado_valor() {   # estado_valor <CLAVE>
+  [ -n "${ESTADO_FILE:-}" ] && [ -r "$ESTADO_FILE" ] || return 0
+  sed -n "s/^$1=//p" "$ESTADO_FILE" | tail -n 1
+}
+
+# Deja constancia de como termino esta ejecucion. ULTIMO_OK solo se mueve
+# cuando el respaldo fue bueno, asi que siempre se puede responder
+# "cuando fue la ultima vez que hubo un respaldo sano".
+estado_escribir() {   # estado_escribir <OK|AVISO|FALLO> <codigo> <detalle> [destino]
+  [ -n "${ESTADO_FILE:-}" ] || return 0
+  local ok_previo bytes_previo ahora
+  ahora="$(date '+%Y-%m-%d %H:%M:%S')"
+  ok_previo="$(estado_valor ULTIMO_OK)"
+  bytes_previo="$(estado_valor ULTIMO_BYTES)"
+  [ "$1" = "OK" ] && ok_previo="$ahora"
+  [ "$1" != "FALLO" ] && [ -n "$ULTIMO_BYTES_NUEVO" ] && bytes_previo="$ULTIMO_BYTES_NUEVO"
+  mkdir -p "$(dirname "$ESTADO_FILE")" 2>/dev/null
+  {
+    echo "ULTIMO_ESTADO=$1"
+    echo "ULTIMO_CODIGO=$2"
+    echo "ULTIMO_DETALLE=$3"
+    echo "ULTIMO_FIN=$ahora"
+    echo "ULTIMO_OK=$ok_previo"
+    echo "ULTIMO_BYTES=$bytes_previo"
+    echo "ULTIMO_DESTINO=${4:-}"
+  } > "$ESTADO_FILE" 2>/dev/null
+  chmod 640 "$ESTADO_FILE" 2>/dev/null
+  return 0
+}
+
+# Unica salida del script: siempre deja escrito el estado.
+salir() {   # salir <codigo> <OK|AVISO|FALLO> <detalle> [destino]
+  estado_escribir "$2" "$1" "$3" "${4:-}"
+  case "$2" in
+    OK)    log "[OK] $3";;
+    AVISO) log "[AVISO] $3";;
+    *)     log "[ERROR] $3";;
+  esac
+  exit "$1"
+}
+
+# Suma en bytes de los archivos regulares de una carpeta. Se usa find y no
+# 'du' porque el tamano que du atribuye a los directorios cambia entre un
+# disco local y un recurso CIFS, y eso daria diferencias falsas.
+bytes_de() { find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'; }
+
+# ---------------------------------------------------------------------
+#  Verificacion del respaldo recien creado
+#  Devuelve 0 correcto - 1 danado - 2 correcto pero con avisos
+# ---------------------------------------------------------------------
+verificar_respaldo() {   # verificar_respaldo <carpeta> <si|rapida|no>
+  local dir="$1" nivel="${2:-si}" f tam hay_sql=0 aviso=0 previo ahora_b
+
+  if [ "$nivel" = "no" ]; then
+    log "[AVISO] La verificacion esta desactivada para este trabajo."
+    ULTIMO_BYTES_NUEVO="$(bytes_de "$dir")"
+    return 0
+  fi
+
+  # 1. El volcado de la base de datos es obligatorio: sin el, no hay respaldo.
+  for f in "$dir"/*.sql.gz; do
+    [ -e "$f" ] || continue
+    hay_sql=1
+    tam="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
+    if [ "$tam" -lt 10240 ]; then
+      log "[ERROR] Verificacion: $(basename "$f") pesa solo ${tam} bytes."
+      return 1
+    fi
+    # 1a. El contenedor gzip esta completo.
+    if ! gzip -t "$f" 2>/dev/null; then
+      log "[ERROR] Verificacion: $(basename "$f") esta corrupto (gzip no puede abrirlo)."
+      return 1
+    fi
+    # 1b. Y el volcado llega hasta el final. Esto es lo que de verdad importa:
+    #     si mysqldump muere a la mitad, gzip recibe fin de entrada y cierra
+    #     un archivo .gz perfectamente valido que contiene un SQL incompleto.
+    #     El unico rastro es que falte la marca de cierre.
+    if ! gzip -dc "$f" 2>/dev/null | tail -c 4000 \
+         | grep -qE -- "-- Dump completed|UNLOCK TABLES;|^COMMIT;"; then
+      log "[ERROR] Verificacion: $(basename "$f") termina a la mitad."
+      log "        El volcado quedo incompleto; no sirve para restaurar."
+      return 1
+    fi
+  done
+  if [ "$hay_sql" -eq 0 ]; then
+    log "[ERROR] Verificacion: no hay ningun volcado .sql.gz en $dir"
+    return 1
+  fi
+
+  # 2. Los archivos adjuntos, si se incluyeron.
+  for f in "$dir"/*.tar; do
+    [ -e "$f" ] || continue
+    tam="$(stat -c '%s' "$f" 2>/dev/null || echo 0)"
+    if [ "$nivel" = "rapida" ] && [ "$tam" -gt 2147483648 ]; then
+      # En modo rapido, sobre un tar enorme se comprueba solo el cierre
+      # (un tar termina en bloques de ceros) en vez de recorrerlo entero.
+      if [ "$(tail -c 1024 "$f" 2>/dev/null | tr -d '\0' | wc -c)" -ne 0 ]; then
+        log "[ERROR] Verificacion: $(basename "$f") no termina correctamente (truncado)."
+        return 1
+      fi
+    else
+      if ! tar -tf "$f" >/dev/null 2>&1; then
+        log "[ERROR] Verificacion: $(basename "$f") esta corrupto (tar no puede leerlo)."
+        return 1
+      fi
+    fi
+  done
+
+  # 3. La configuracion del sitio que acompana al respaldo.
+  for f in "$dir"/*.json; do
+    [ -e "$f" ] || continue
+    [ -s "$f" ] || { log "[ERROR] Verificacion: $(basename "$f") esta vacio."; return 1; }
+  done
+
+  # 4. Comparacion con el ultimo respaldo bueno. No invalida nada: avisa.
+  #    Un respaldo que de pronto pesa la mitad suele significar que se
+  #    perdieron datos en origen, no que la copia fallara.
+  ahora_b="$(bytes_de "$dir")"
+  ULTIMO_BYTES_NUEVO="$ahora_b"
+  previo="$(estado_valor ULTIMO_BYTES)"
+  if [ -n "$previo" ] && [ "$previo" -gt 0 ] 2>/dev/null; then
+    if [ "$((ahora_b * 2))" -lt "$previo" ]; then
+      log "[AVISO] Este respaldo pesa ${ahora_b} bytes; el anterior pesaba ${previo}."
+      log "        Menos de la mitad. Revise que no se hayan perdido datos en el sitio."
+      aviso=1
+    fi
+  fi
+
+  log "[OK] Verificacion superada: el respaldo se puede abrir y esta completo."
+  [ "$aviso" -eq 1 ] && return 2
+  return 0
+}
+
+# Huella de cada archivo, para poder comprobar el respaldo el dia de la
+# restauracion con:  sha256sum -c SHA256SUMS
+escribir_huellas() {   # escribir_huellas <carpeta>
+  ( cd "$1" 2>/dev/null || exit 0
+    : > SHA256SUMS
+    for f in *; do
+      [ -f "$f" ] && [ "$f" != "SHA256SUMS" ] && sha256sum "$f" >> SHA256SUMS
+    done ) 2>/dev/null
+  return 0
+}
 
 # Retencion por niveles sobre <remoto>/<dd-mes-aaaa>
 retencion_niveles_drive() {
@@ -982,38 +1543,119 @@ FECHA="$(date +'%d-%B-%Y' | tr '[:upper:]' '[:lower:]')"
 HORA="$(date +'%H-%M')"
 DESTINO="${RCLONE_REMOTE}:${DEST_PATH}/${FECHA}/${HORA}"
 
-mkdir -p "$TEMP_LOCAL" || { log "[ERROR] No se pudo crear $TEMP_LOCAL"; exit 1; }
+log "[INFO] Inicio del respaldo de '${SITE}' hacia ${RCLONE_REMOTE}:${DEST_PATH}"
+
+# ---- 1. Carpeta temporal limpia -------------------------------------
+mkdir -p "$TEMP_LOCAL" || salir 1 FALLO "No se pudo crear $TEMP_LOCAL"
 rm -rf "${TEMP_LOCAL:?}"/*
 
-cd "$BENCH_PATH" || { log "[ERROR] No existe $BENCH_PATH"; exit 1; }
+# ---- 2. Crear el respaldo -------------------------------------------
+cd "$BENCH_PATH" || salir 1 FALLO "No existe el bench: $BENCH_PATH"
 # shellcheck disable=SC1091
 . env/bin/activate
 BENCH_ARGS=(--site "$SITE" backup)
 [ "${WITH_FILES:-si}" = "si" ] && BENCH_ARGS+=(--with-files)
-bench "${BENCH_ARGS[@]}" >/dev/null 2>&1 || { log "[ERROR] 'bench backup' fallo para $SITE"; exit 2; }
+SALIDA_BENCH="$(bench "${BENCH_ARGS[@]}" 2>&1)" || {
+  printf '%s\n' "$SALIDA_BENCH" | tail -n 15
+  salir 2 FALLO "'bench backup' fallo para $SITE"
+}
 
-if [ -d "$BACKUP_ORIGEN" ] && [ -n "$(ls -A "$BACKUP_ORIGEN" 2>/dev/null)" ]; then
-  cp -r "$BACKUP_ORIGEN"/* "$TEMP_LOCAL"/ || { log "[ERROR] No se pudo copiar a $TEMP_LOCAL"; exit 3; }
-  if rclone copy "$TEMP_LOCAL" "$DESTINO" \
+if [ ! -d "$BACKUP_ORIGEN" ] || [ -z "$(ls -A "$BACKUP_ORIGEN" 2>/dev/null)" ]; then
+  salir 5 FALLO "bench no dejo ningun archivo en $BACKUP_ORIGEN"
+fi
+
+# ---- 3. Verificar ANTES de subir y ANTES de borrar nada --------------
+verificar_respaldo "$BACKUP_ORIGEN" "${VERIFICAR:-si}"; VERIF=$?
+if [ "$VERIF" -eq 1 ]; then
+  salir 6 FALLO "El respaldo recien creado esta danado. Se conserva en ${BACKUP_ORIGEN} y no se subio nada."
+fi
+[ "${VERIFICAR:-si}" = "no" ] || escribir_huellas "$BACKUP_ORIGEN"
+
+# ---- 4. Armar el paquete y subirlo ----------------------------------
+cp -r "$BACKUP_ORIGEN"/* "$TEMP_LOCAL"/ || salir 3 FALLO "No se pudo copiar a $TEMP_LOCAL"
+
+if ! rclone copy "$TEMP_LOCAL" "$DESTINO" \
+     --contimeout 30s --timeout 5m --retries 3 --low-level-retries 10 \
+     --log-file="$RCLONE_LOG" --log-level INFO; then
+  rm -rf "${TEMP_LOCAL:?}"/*
+  salir 4 FALLO "Fallo la subida hacia $DESTINO" "$DESTINO"
+fi
+
+# ---- 5. Comprobar que lo que quedo en Drive sea lo que se subio ------
+# Devuelve 0 si coincide, 1 si hay diferencias o si no se pudo comprobar.
+comprobar_en_drive() {   # comprobar_en_drive <carpeta local> <destino>
+  local extra=() salida est sin_hash l
+  [ "${VERIFICAR_DESTINO:-hash}" = "descarga" ] && extra=(--download)
+  salida="$(rclone check "$1" "$2" --one-way "${extra[@]:+${extra[@]}}" \
+              --contimeout 30s --timeout 5m --retries 2 2>&1)"; est=$?
+  printf '%s\n' "$salida" >> "$RCLONE_LOG" 2>/dev/null
+
+  if [ "$est" -ne 0 ]; then
+    printf '%s\n' "$salida" | grep -Ei "differ|missing|not in|error" | head -n 5 \
+      | while IFS= read -r l; do log "        $l"; done
+    return 1
+  fi
+
+  # Si rclone no pudo obtener el hash de algun archivo, para ese archivo
+  # solo comparo tamanos, y un archivo danado del mismo tamano pasaria
+  # inadvertido. Comprobado: con comparacion por tamano, un archivo
+  # corrupto del mismo peso devuelve 0. Asi que esto NO se deja pasar.
+  sin_hash="$(printf '%s' "$salida" \
+    | sed -nE 's/.*[^0-9]([0-9]+) hashes could not be checked.*/\1/p' | tail -n 1)"
+  if [ -n "$sin_hash" ] && [ "$sin_hash" -gt 0 ] 2>/dev/null; then
+    log "[ERROR] Google no devolvio el hash de ${sin_hash} archivo(s)."
+    log "        Solo se pudo comparar el tamano, y eso no prueba que el"
+    log "        contenido este bien. Se trata como fallo a proposito."
+    return 1
+  fi
+  return 0
+}
+
+INTENTO=1
+while :; do
+  if [ "${VERIFICAR_DESTINO:-hash}" = "descarga" ]; then
+    log "[INFO] Comprobando en Drive: se descarga de vuelta y se compara byte a byte..."
+  else
+    log "[INFO] Comprobando en Drive: se comparan los hashes que reporta Google..."
+  fi
+  comprobar_en_drive "$TEMP_LOCAL" "$DESTINO" && break
+
+  if [ "$INTENTO" -ge 2 ]; then
+    rm -rf "${TEMP_LOCAL:?}"/*
+    salir 4 FALLO "Lo que quedo en ${DESTINO} no coincide con lo que se subio, ni siquiera tras resubirlo. El respaldo local NO se borro." "$DESTINO"
+  fi
+  # Esto es lo que usted haria a mano: borrar lo que quedo mal y subirlo
+  # otra vez. Se hace aqui mismo, mientras el respaldo local todavia existe.
+  log "[AVISO] La copia en Drive no coincide. Se borra y se sube de nuevo."
+  rclone purge "$DESTINO" >/dev/null 2>&1
+  if ! rclone copy "$TEMP_LOCAL" "$DESTINO" \
        --contimeout 30s --timeout 5m --retries 3 --low-level-retries 10 \
        --log-file="$RCLONE_LOG" --log-level INFO; then
-    log "[OK] Respaldo subido a $DESTINO"
-    [ "${BORRAR_ORIGEN:-si}" = "si" ] && rm -rf "${BACKUP_ORIGEN:?}"/*
-  else
-    log "[ERROR] Fallo la subida hacia $DESTINO"
-    rm -rf "${TEMP_LOCAL:?}"/*; exit 4
+    rm -rf "${TEMP_LOCAL:?}"/*
+    salir 4 FALLO "Fallo el reintento de subida hacia ${DESTINO}. El respaldo local NO se borro." "$DESTINO"
   fi
-else
-  log "[ERROR] No se encontraron archivos en $BACKUP_ORIGEN"; exit 5
+  INTENTO=2
+done
+log "[OK] Comprobado en Drive: lo que quedo alla es identico a lo que se subio."
+
+# ---- 6. Recien ahora se libera el disco local ------------------------
+if [ "${BORRAR_ORIGEN:-si}" = "si" ]; then
+  find "$BACKUP_ORIGEN" -mindepth 1 -type f -delete 2>/dev/null
 fi
 rm -rf "${TEMP_LOCAL:?}"/*
 
+# ---- 7. Retencion: solo despues de un respaldo bueno -----------------
 retencion_niveles_drive "${RCLONE_REMOTE}:${DEST_PATH}" "${RETENCION_DIAS:-0}" \
   "${MENSUAL_CONSERVAR:-no}" "${MENSUAL_MESES:-0}"
-exit 0
+
+if [ "$VERIF" -eq 2 ]; then
+  salir 0 AVISO "Respaldo correcto en ${DESTINO}, pero mucho mas pequeno que el anterior." "$DESTINO"
+fi
+salir 0 OK "Respaldo verificado en ${DESTINO}" "$DESTINO"
 EOF
   chmod 750 "$2"
 }
+
 
 # ====================== CREAR TRABAJO: RED ===========================
 # Los asistentes son maquinas de pasos: cada paso puede devolver
@@ -1029,7 +1671,8 @@ crear_trabajo_red() {
   local ETIQUETA="" JOB="" CONF="" SCRIPT="" CRED_FILE="" LOG_FILE=""
   local SRV="" SMB_PORT="445" CIFS_USER="" CIFS_PASS="" CIFS_DOM="" SHARE="" SUB="" UNC=""
   local SMB_VERS="" MOUNT_POINT="" MOUNT_OPTS=""
-  local BENCH_PATH="" SITE="" BACKUP_ORIGEN="" WITH_FILES=""
+  local BENCH_PATH="" SITE="" BACKUP_ORIGEN="" WITH_FILES="" VERIFICAR="si" ESTADO_FILE=""
+  local VERIFICAR_DESTINO="basico" TIPO_TRABAJO="red"
   local RETENCION_DIAS="" MENSUAL_CONSERVAR="no" MENSUAL_MESES="0" HORARIOS="" DIAS_CRON=""
   local paso=1 estado NAV_ON=1 volver_resumen=0
 
@@ -1082,6 +1725,7 @@ red_paso_etiqueta() {
   pedir_etiqueta || return $?
   CONF="${APP_DIR}/${JOB}.conf"; SCRIPT="${BIN_DIR}/${JOB}.sh"
   CRED_FILE="${APP_DIR}/${JOB}.cred"; LOG_FILE="${LOG_DIR}/${JOB}.log"
+  ESTADO_FILE="${APP_DIR}/${JOB}.estado"
   return 0
 }
 
@@ -1307,7 +1951,8 @@ red_paso_resumen() {
     say "   ${C_B}4${C_R}) Recurso       : ${SHARE}"
     say "   ${C_B}5${C_R}) Subcarpeta    : ${SUB:-(ninguna)}"
     say "   ${C_B}6${C_R}) Conexion      : ${UNC}   SMB ${SMB_VERS}   en ${MOUNT_POINT}"
-    say "   ${C_B}7${C_R}) Sitio         : ${SITE}   adjuntos: ${WITH_FILES}"
+    say "   ${C_B}7${C_R}) Sitio         : ${SITE}   adjuntos: ${WITH_FILES}   verificacion: $(describir_verificacion "$VERIFICAR")"
+    say "       ${C_DIM}destino comprobado: $(describir_verificacion_destino "$VERIFICAR_DESTINO")${C_R}"
     say "   ${C_B}8${C_R}) Retencion     : $(describir_retencion "$RETENCION_DIAS" "$MENSUAL_CONSERVAR" "$MENSUAL_MESES")"
     say "   ${C_B}9${C_R}) Programacion  : ${HORARIOS}  ($(describir_dias "$DIAS_CRON"))"
     echo
@@ -1348,9 +1993,11 @@ red_paso_resumen() {
     "UNC=${UNC}" "MOUNT_POINT=${MOUNT_POINT}" "CRED_FILE=${CRED_FILE}" \
     "SMB_VERS=${SMB_VERS}" "MOUNT_OPTS=${MOUNT_OPTS}" \
     "BENCH_PATH=${BENCH_PATH}" "SITE=${SITE}" "BACKUP_ORIGEN=${BACKUP_ORIGEN}" \
-    "WITH_FILES=${WITH_FILES}" "RETENCION_DIAS=${RETENCION_DIAS}" \
+    "WITH_FILES=${WITH_FILES}" "VERIFICAR=${VERIFICAR}" "VERIFICAR_DESTINO=${VERIFICAR_DESTINO}" \
+    "RETENCION_DIAS=${RETENCION_DIAS}" \
     "MENSUAL_CONSERVAR=${MENSUAL_CONSERVAR}" "MENSUAL_MESES=${MENSUAL_MESES}" \
-    "HORARIOS=${HORARIOS}" "DIAS_CRON=${DIAS_CRON}" "LOG_FILE=${LOG_FILE}"
+    "HORARIOS=${HORARIOS}" "DIAS_CRON=${DIAS_CRON}" "LOG_FILE=${LOG_FILE}" \
+    "ESTADO_FILE=${ESTADO_FILE}"
 
   generar_script_red "$CONF" "$SCRIPT"
   touch "$LOG_FILE"; chmod 640 "$LOG_FILE"
@@ -1378,8 +2025,9 @@ crear_trabajo_drive() {
     enter; return 1
   fi
 
-  local ETIQUETA="" JOB="" CONF="" SCRIPT="" LOG_FILE="" RCLONE_LOG=""
-  local RCLONE_REMOTE="" DEST_PATH="" TEMP_LOCAL=""
+  local ETIQUETA="" JOB="" CONF="" SCRIPT="" LOG_FILE="" RCLONE_LOG="" ESTADO_FILE=""
+  local RCLONE_REMOTE="" DEST_PATH="" TEMP_LOCAL="" VERIFICAR="si"
+  local VERIFICAR_DESTINO="hash" TIPO_TRABAJO="drive"
   local BENCH_PATH="" SITE="" BACKUP_ORIGEN="" WITH_FILES="" BORRAR_ORIGEN="si"
   local RETENCION_DIAS="" MENSUAL_CONSERVAR="no" MENSUAL_MESES="0" HORARIOS="" DIAS_CRON=""
   local paso=1 estado NAV_ON=1 volver_resumen=0
@@ -1423,6 +2071,7 @@ drv_paso_etiqueta() {
   pedir_etiqueta || return $?
   CONF="${APP_DIR}/${JOB}.conf"; SCRIPT="${BIN_DIR}/${JOB}.sh"
   LOG_FILE="${LOG_DIR}/${JOB}.log"; RCLONE_LOG="${LOG_DIR}/${JOB}-rclone.log"
+  ESTADO_FILE="${APP_DIR}/${JOB}.estado"
   return 0
 }
 
@@ -1528,7 +2177,8 @@ drv_paso_resumen() {
     say "   ${C_B}2${C_R}) Cuenta        : ${RCLONE_REMOTE}"
     say "   ${C_B}3${C_R}) Carpeta       : ${RCLONE_REMOTE}:${DEST_PATH}"
     say "   ${C_B}4${C_R}) Temporal      : ${TEMP_LOCAL}"
-    say "   ${C_B}5${C_R}) Sitio         : ${SITE}   adjuntos: ${WITH_FILES}"
+    say "   ${C_B}5${C_R}) Sitio         : ${SITE}   adjuntos: ${WITH_FILES}   verificacion: $(describir_verificacion "$VERIFICAR")"
+    say "       ${C_DIM}destino comprobado: $(describir_verificacion_destino "$VERIFICAR_DESTINO")${C_R}"
     say "   ${C_B}6${C_R}) Borrar local  : ${BORRAR_ORIGEN}"
     say "   ${C_B}7${C_R}) Retencion     : $(describir_retencion "$RETENCION_DIAS" "$MENSUAL_CONSERVAR" "$MENSUAL_MESES")"
     say "   ${C_B}8${C_R}) Programacion  : ${HORARIOS}  ($(describir_dias "$DIAS_CRON"))"
@@ -1553,11 +2203,12 @@ drv_paso_resumen() {
     "RCLONE_REMOTE=${RCLONE_REMOTE}" "DEST_PATH=${DEST_PATH}" \
     "RCLONE_CONFIG=/root/.config/rclone/rclone.conf" "TEMP_LOCAL=${TEMP_LOCAL}" \
     "BENCH_PATH=${BENCH_PATH}" "SITE=${SITE}" "BACKUP_ORIGEN=${BACKUP_ORIGEN}" \
-    "WITH_FILES=${WITH_FILES}" "BORRAR_ORIGEN=${BORRAR_ORIGEN}" \
+    "WITH_FILES=${WITH_FILES}" "VERIFICAR=${VERIFICAR}" "VERIFICAR_DESTINO=${VERIFICAR_DESTINO}" \
+    "BORRAR_ORIGEN=${BORRAR_ORIGEN}" \
     "RETENCION_DIAS=${RETENCION_DIAS}" \
     "MENSUAL_CONSERVAR=${MENSUAL_CONSERVAR}" "MENSUAL_MESES=${MENSUAL_MESES}" \
     "HORARIOS=${HORARIOS}" "DIAS_CRON=${DIAS_CRON}" \
-    "LOG_FILE=${LOG_FILE}" "RCLONE_LOG=${RCLONE_LOG}"
+    "LOG_FILE=${LOG_FILE}" "RCLONE_LOG=${RCLONE_LOG}" "ESTADO_FILE=${ESTADO_FILE}"
 
   generar_script_drive "$CONF" "$SCRIPT"
   touch "$LOG_FILE" "$RCLONE_LOG"; chmod 640 "$LOG_FILE" "$RCLONE_LOG"
@@ -1674,8 +2325,10 @@ menu_trabajo() {
       say "  Destino : ${RCLONE_REMOTE}:${DEST_PATH}"
     fi
     say "  Sitio   : ${SITE}   adjuntos: ${WITH_FILES}"
+    say "  Verificacion: $(describir_verificacion "${VERIFICAR:-si}")   destino: $(describir_verificacion_destino "${VERIFICAR_DESTINO:-}")"
     say "  Retencion: $(describir_retencion "${RETENCION_DIAS:-0}" "${MENSUAL_CONSERVAR:-no}" "${MENSUAL_MESES:-0}")"
     say "  Horario : ${HORARIOS}   ($(describir_dias "$DIAS_CRON"))"
+    say "  Respaldo: $(estado_resumen "$conf")"
     echo
     say "   1) Ejecutar respaldo ahora"
     say "   2) Horarios y dias"
@@ -1683,6 +2336,7 @@ menu_trabajo() {
     say "   4) Que se respalda (bench, sitio, adjuntos)"
     say "   5) Retencion"
     say "   6) Ver configuracion y log"
+    say "   c) Comprobar un respaldo ya guardado"
     if [ "$JOB_TIPO" = "red" ]; then
       say "   7) Credenciales del recurso"
       say "   8) Montar ahora"
@@ -1723,10 +2377,13 @@ menu_trabajo() {
          fi
          enter;;
       4) pantalla "TRABAJO '${ETIQUETA}'  >  Que se respalda"
+         TIPO_TRABAJO="$JOB_TIPO"
          if pedir_frappe; then
            set_conf "$conf" BENCH_PATH "$BENCH_PATH"; set_conf "$conf" SITE "$SITE"
            set_conf "$conf" BACKUP_ORIGEN "$BACKUP_ORIGEN"; set_conf "$conf" WITH_FILES "$WITH_FILES"
-           ok "Actualizado."
+           set_conf "$conf" VERIFICAR "$VERIFICAR"
+           set_conf "$conf" VERIFICAR_DESTINO "$VERIFICAR_DESTINO"
+           ok "Actualizado. Verificacion: $(describir_verificacion "$VERIFICAR")"
          fi; enter;;
       5) pantalla "TRABAJO '${ETIQUETA}'  >  Retencion"
          if pedir_retencion; then
@@ -1736,6 +2393,7 @@ menu_trabajo() {
            ok "Retencion: $(describir_retencion "$RETENCION_DIAS" "$MENSUAL_CONSERVAR" "$MENSUAL_MESES")"
          fi; enter;;
       6) pantalla "TRABAJO '${ETIQUETA}'  >  Configuracion"
+         estado_detalle "$conf"; echo
          sed 's/^/    /' "$conf"; echo
          say "  ${C_B}Cron activo:${C_R}"; cron_mostrar "$JOB_NOMBRE"; echo
          say "  ${C_B}Ultimas lineas del log:${C_R}"
@@ -1760,6 +2418,7 @@ menu_trabajo() {
            ok "Montado."; df -h "$MOUNT_POINT" | tail -n1 | sed 's/^/    /'
          else explicar_error_mount "$sal3"; fi
          enter;;
+      c|C) comprobar_respaldo_guardado "$conf";;
       9) eliminar_trabajo "$conf" && return 0;;
       0) return 0;;
       *) err "Opcion invalida."; sleep 1;;
@@ -1790,6 +2449,7 @@ menu_trabajos() {
           printf '%b\n' "   ${C_B}$((i+1))) ${ETIQUETA}${C_R}  ${C_DIM}[${JOB_TIPO}]${C_R}  ${estado}"
           printf '%b\n' "       ${C_DIM}destino: ${destino}${C_R}"
           printf '%b\n' "       ${C_DIM}horario: ${HORARIOS}  ($(describir_dias "$DIAS_CRON"))${C_R}"
+          printf '%b\n' "       respaldo: $(estado_resumen "${confs[$i]}")"
         )
       done
     fi
@@ -1854,6 +2514,7 @@ diagnostico() {
         else err "sin acceso a ${RCLONE_REMOTE}:${DEST_PATH}"; fi
       fi )
     echo; diag_frappe "${confs[$i]}"
+    echo; estado_detalle "${confs[$i]}"
     echo
     ( cargar_conf "${confs[$i]}"
       say "  ${C_B}Programacion y registro${C_R}"
@@ -1869,13 +2530,146 @@ diagnostico() {
   done
 }
 
+# ============ COMPROBAR UN RESPALDO YA GUARDADO ======================
+# Cada respaldo viaja con su SHA256SUMS. Esto permite auditar cualquiera
+# de los que ya estan en el destino, sin esperar al dia de la
+# restauracion para descubrir que uno no servia.
+elegir_carpeta_respaldo() {   # elegir_carpeta_respaldo <lista por lineas>
+  local items=() i op
+  mapfile -t items < <(printf '%s\n' "$1" | grep -v '^$' | sort -r)
+  if [ "${#items[@]}" -eq 0 ]; then
+    warn "No se encontro ningun respaldo en el destino."; return 1
+  fi
+  say "  Respaldos disponibles (del mas reciente al mas antiguo):"
+  for i in "${!items[@]}"; do
+    [ "$i" -ge 20 ] && { say "    ${C_DIM}... y $(( ${#items[@]} - 20 )) mas${C_R}"; break; }
+    say "    $((i+1))) ${items[$i]}"
+  done
+  echo
+  read -rp "  Numero del respaldo a comprobar (0 = volver): " op || fin_entrada
+  [ "$op" = "0" ] && return 1
+  if [[ "$op" =~ ^[0-9]+$ ]] && [ "$op" -ge 1 ] && [ "$op" -le "${#items[@]}" ]; then
+    CARPETA_ELEGIDA="${items[$((op-1))]}"; return 0
+  fi
+  err "Opcion invalida."; return 1
+}
+
+comprobar_respaldo_guardado() {   # comprobar_respaldo_guardado <archivo .conf>
+  local conf="$1" lista ruta tmp res
+  cargar_conf "$conf"
+  pantalla "TRABAJO '${ETIQUETA}'  >  Comprobar un respaldo guardado"
+
+  if [ "$JOB_TIPO" = "red" ]; then
+    mountpoint -q "$MOUNT_POINT" || { err "El recurso no esta montado."; enter; return 1; }
+    lista="$(find "$MOUNT_POINT" -mindepth 2 -maxdepth 2 -type d -printf '%P\n' 2>/dev/null)"
+    elegir_carpeta_respaldo "$lista" || { enter; return 1; }
+    ruta="${MOUNT_POINT}/${CARPETA_ELEGIDA}"
+    if [ ! -f "${ruta}/SHA256SUMS" ]; then
+      warn "Ese respaldo no tiene SHA256SUMS."
+      say  "  ${C_DIM}Se creo con una version anterior a la 2.4.0; no se puede comprobar asi.${C_R}"
+      enter; return 1
+    fi
+    echo; info "Leyendo el respaldo desde el destino y recalculando las huellas..."
+    say "  ${C_DIM}Se lee por la red: puede tardar segun el tamano.${C_R}"; echo
+    res="$( cd "$ruta" && sha256sum -c SHA256SUMS 2>&1 )"
+  else
+    lista="$(rc lsf "${RCLONE_REMOTE}:${DEST_PATH}" --dirs-only -R 2>/dev/null \
+             | sed 's:/$::' | grep '/' )"
+    elegir_carpeta_respaldo "$lista" || { enter; return 1; }
+    ruta="${RCLONE_REMOTE}:${DEST_PATH}/${CARPETA_ELEGIDA}"
+    echo
+    warn "Para comprobarlo hay que descargarlo de vuelta desde Drive."
+    si_no "Continuar?" || { enter; return 1; }
+    tmp="$(mktemp -d)"
+    info "Descargando..."
+    if ! rclone copy "$ruta" "$tmp" --contimeout 30s --timeout 10m --retries 2 >/dev/null 2>&1; then
+      err "No se pudo descargar el respaldo."; rm -rf "$tmp"; enter; return 1
+    fi
+    if [ ! -f "${tmp}/SHA256SUMS" ]; then
+      warn "Ese respaldo no tiene SHA256SUMS (se creo con una version anterior)."
+      rm -rf "$tmp"; enter; return 1
+    fi
+    res="$( cd "$tmp" && sha256sum -c SHA256SUMS 2>&1 )"
+  fi
+
+  local est=$?
+  echo
+  if printf '%s' "$res" | grep -q "FAILED\|FALL"; then
+    err "El respaldo NO esta integro:"
+    printf '%s\n' "$res" | grep -i "failed\|fall" | head -n 10 | sed 's/^/    /'
+    echo
+    say "  ${C_RD}No confie en este respaldo para restaurar.${C_R}"
+  elif [ "$est" -ne 0 ] && [ -z "$res" ]; then
+    err "No se pudo comprobar."
+  else
+    ok "Respaldo integro: todas las huellas coinciden."
+    printf '%s\n' "$res" | tail -n 5 | sed 's/^/    /'
+  fi
+  [ -n "${tmp:-}" ] && rm -rf "$tmp"
+  enter
+  return 0
+}
+
+# ===================== MIGRACION DE TRABAJOS =========================
+# Actualizar el gestor NO actualiza los scripts ya generados: siguen en
+# disco tal como se escribieron. Sin esto, un trabajo creado con una
+# version anterior seguiria respaldando sin verificar nada.
+migrar_trabajos() {
+  local c tipo job n=0
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    grep -q "^GEN_VERSION=\"${GEN_VERSION_ACTUAL}\"" "$c" 2>/dev/null && continue
+    grep -q '^VERIFICAR='   "$c" 2>/dev/null || set_conf "$c" VERIFICAR "si"
+    if ! grep -q '^VERIFICAR_DESTINO=' "$c" 2>/dev/null; then
+      if grep -q '^JOB_TIPO="drive"' "$c" 2>/dev/null; then
+        set_conf "$c" VERIFICAR_DESTINO "hash"
+      else
+        set_conf "$c" VERIFICAR_DESTINO "basico"
+      fi
+    fi
+    grep -q '^ESTADO_FILE=' "$c" 2>/dev/null || set_conf "$c" ESTADO_FILE "${c%.conf}.estado"
+    tipo="$(sed -n 's/^JOB_TIPO="\(.*\)"$/\1/p'    "$c" | tail -n 1)"
+    job="$(sed  -n 's/^JOB_NOMBRE="\(.*\)"$/\1/p'  "$c" | tail -n 1)"
+    if [ -n "$job" ]; then
+      if [ "$tipo" = "red" ]; then
+        generar_script_red   "$c" "${BIN_DIR}/${job}.sh"
+      else
+        generar_script_drive "$c" "${BIN_DIR}/${job}.sh"
+      fi
+      n=$((n+1))
+    fi
+    set_conf "$c" GEN_VERSION "$GEN_VERSION_ACTUAL"
+  done < <(listar_confs)
+
+  [ "$n" -eq 0 ] && return 0
+  pantalla "ACTUALIZACION DE TRABAJOS"
+  ok "Se actualizaron ${n} trabajo(s) a la version ${GEN_VERSION_ACTUAL}."
+  echo
+  say "  A partir de ahora, antes de dar un respaldo por bueno se comprueba que"
+  say "  el volcado se pueda abrir y que no haya quedado a la mitad. Si la"
+  say "  comprobacion falla, el respaldo local no se borra y la retencion no se"
+  say "  aplica, para no perder un respaldo bueno por uno danado."
+  echo
+  say "  ${C_DIM}Los horarios, destinos y retenciones no cambiaron.${C_R}"
+  say "  ${C_DIM}La verificacion quedo en 'completa'; se puede ajustar desde${C_R}"
+  say "  ${C_DIM}cada trabajo, en 'Que se respalda'.${C_R}"
+  enter
+  return 0
+}
+
 # ========================= MENU PRINCIPAL ============================
 menu_principal() {
-  local op n_trabajos n_cuentas
+  local op n_trabajos n_cuentas n_fallos
   while true; do
     pantalla "MENU PRINCIPAL"
     n_trabajos="$(listar_confs | wc -l)"
     n_cuentas="$(rclone listremotes 2>/dev/null | wc -l)"
+    n_fallos="$(trabajos_fallidos)"
+    if [ "$n_fallos" -gt 0 ]; then
+      say "  ${C_RD}${C_B}  ATENCION: ${n_fallos} trabajo(s) con el ultimo respaldo FALLIDO.${C_R}"
+      say "  ${C_DIM}  Entre en 'Trabajos de respaldo' para ver cual y por que.${C_R}"
+      echo
+    fi
     say "   1) Trabajos de respaldo      ${C_DIM}-${C_R} ${n_trabajos} configurado(s)"
     say "   2) Cuentas de Google Drive   ${C_DIM}-${C_R} ${n_cuentas} conectada(s)"
     say "   3) Diagnostico"
@@ -1897,4 +2691,5 @@ menu_principal() {
 
 requiere_root
 mkdir -p "$APP_DIR" "$LOG_DIR"; chmod 750 "$APP_DIR"
+migrar_trabajos
 menu_principal
