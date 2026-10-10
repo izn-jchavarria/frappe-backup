@@ -150,6 +150,14 @@ El servidor no tiene navegador y Google exige uno para autorizar, así que el tr
 
 El respaldo se sube a `<cuenta>:<ruta>/<fecha>/<hora>/`, se borra el temporal y —opcionalmente— el respaldo local.
 
+Desde la 2.6.0, cada ejecución hacia Drive:
+
+- **Arma su respaldo en una carpeta propia** (`bench backup --backup-path`) y sube **solo eso**. Lo que haya en la carpeta de respaldos del sitio —los respaldos automáticos de Frappe, restos de otras corridas— no se sube, no se verifica y no se borra. Un archivo dañado de otra corrida ya no puede bloquear las siguientes.
+- **Comprueba antes de empezar** que Drive responda y que haya espacio en el servidor y en la cuenta. Si algo falta, `bench` ni se ejecuta.
+- **Muestra el avance** de la subida cada minuto (cuánto lleva, velocidad y tiempo restante) y avisa si Google está limitando las peticiones (403), la causa habitual de subidas que parecen detenidas.
+- **Sube a una carpeta provisional** `<hora>.subiendo.<trabajo>` y solo la renombra a `<hora>` cuando Drive confirma que llegó idéntica. Si algo falla o el proceso se corta, lo que quedó a medias se elimina en la siguiente ejecución.
+- **No se cruza consigo misma**: si una ejecución sigue en curso, la siguiente no corre.
+
 ---
 
 ## Menú de cada trabajo

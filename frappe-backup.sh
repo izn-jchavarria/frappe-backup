@@ -3,7 +3,7 @@
 #  iZONE ENTERPRISE - BACKUPS
 #  Gestor de respaldos para Frappe / ERPNext
 #  Destinos soportados: Unidad de Red (CIFS o rclone) y Google Drive (rclone)
-#  Version: 2.5.0
+#  Version: 2.6.0
 #
 #  Un respaldo que no se puede restaurar no es un respaldo. Desde la 2.4.0
 #  cada ejecucion comprueba que el volcado se pueda abrir y este completo
@@ -17,6 +17,12 @@
 #  camino cada respaldo se relee desde el NAS byte a byte y solo recibe
 #  su nombre definitivo despues de esa comprobacion.
 #
+#  Desde la 2.6.0 los trabajos de Google Drive arman cada respaldo en su
+#  propia carpeta y suben solo eso: lo que haya en la carpeta de respaldos
+#  del sitio (los automaticos de Frappe, restos de otras corridas) ya no se
+#  sube ni bloquea las verificaciones. La subida muestra su avance y usa
+#  una carpeta provisional .subiendo hasta quedar comprobada.
+#
 #  Uso:  sudo ./izone-backup-manager.sh
 # =====================================================================
 set -uo pipefail
@@ -29,11 +35,13 @@ HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"
 BASE="${HOST_SHORT}-backup"
 RCLONE_ESPERA=150
 NAV_ON=0          # 1 dentro de los asistentes: habilita v=volver, x=cancelar
-# Version del codigo que se escribe en los scripts. Si cambia, al abrir el
-# gestor se regeneran los scripts de TODOS los trabajos. La 2.5.0 no toca
-# los scripts de CIFS ni de Drive, por eso sigue en 2.4.0: los trabajos
-# que ya estan en produccion no se reescriben.
+# Version del codigo que se escribe en los scripts, una por tipo. Si
+# cambia, al abrir el gestor se regeneran los scripts de los trabajos de
+# ESE tipo, y solo de ese: corregir Drive no reescribe los de red.
+#   GEN_VERSION_ACTUAL : Unidad de Red (CIFS y rclone)
+#   GEN_VERSION_DRIVE  : Google Drive
 GEN_VERSION_ACTUAL="2.4.0"
+GEN_VERSION_DRIVE="2.6.0"
 # Copia de rclone propia del gestor, solo para la red sin montaje. Se usa
 # cuando el rclone del sistema no trae SMB; nunca reemplaza al del sistema.
 RCLONE_PRIV="/usr/local/lib/izone-backup/rclone"
@@ -1642,15 +1650,20 @@ generar_script_drive() {
 # Generado por iZone ENTERPRISE - BACKUPS  -  destino: Google Drive (rclone)
 # La configuracion vive en el .conf; no edite valores aqui.
 #
+# Cada ejecucion arma SU respaldo en una carpeta propia y sube solo eso:
+# lo que haya en la carpeta de respaldos del sitio (los automaticos de
+# Frappe, restos de otras corridas) no se sube, no se verifica y no se borra.
+#
 # Codigos de salida:
-#   0 correcto   1 entorno o rutas   2 fallo 'bench backup'
-#   3 fallo la copia local   4 fallo la subida o la verificacion en Drive
-#   5 bench no dejo archivos   6 respaldo danado
+#   0 correcto   1 entorno, rutas o espacio   2 fallo 'bench backup'
+#   4 fallo la subida o la verificacion en Drive   5 bench no dejo archivos
+#   6 respaldo danado   7 otra ejecucion de este trabajo sigue en curso
 CONF="$1"
 EOF
   cat >> "$2" <<'EOF'
 set -uo pipefail
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+umask 027
 [ -r "$CONF" ] || { echo "[ERROR] No se encuentra la configuracion: $CONF"; exit 1; }
 # shellcheck disable=SC1090
 . "$CONF"
@@ -1808,6 +1821,133 @@ escribir_huellas() {   # escribir_huellas <carpeta>
   return 0
 }
 
+# ---------------------------------------------------------------------
+#  Envio a Google Drive
+# ---------------------------------------------------------------------
+TRABAJO="${TEMP_LOCAL:-/var/tmp/izone-backup/${JOB_NOMBRE}}"
+EN_CURSO="${TRABAJO}/en-curso"
+SUFIJO=".subiendo.${JOB_NOMBRE}"
+REMOTO="${RCLONE_REMOTE}:${DEST_PATH}"
+RCLONE_LOG="${RCLONE_LOG:-/var/log/izone-backup/${JOB_NOMBRE}-rclone.log}"
+GUARDADO=""
+# RC_RED para subir y comprobar; RC_RAPIDO para consultas que no deben colgarse.
+RC_RED=(--contimeout 30s --timeout 5m --retries 3 --low-level-retries 10)
+RC_RAPIDO=(--contimeout 20s --timeout 2m --retries 2 --low-level-retries 3)
+
+# rclone con su salida en el log propio del trabajo
+rcl() { rclone "$@" >>"$RCLONE_LOG" 2>&1; }
+
+# 0 si en la carpeta caben <kb> y aun queda libre una reserva para que el
+# sistema y la base de datos sigan trabajando. Detalle en ESPACIO_MSG.
+espacio_suficiente() {   # espacio_suficiente <carpeta> <kb necesarios>
+  local libre total reserva
+  libre="$(df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $4}')"
+  total="$(df -Pk "$1" 2>/dev/null | awk 'NR==2 {print $2}')"
+  if ! [[ "$libre" =~ ^[0-9]+$ ]] || ! [[ "$total" =~ ^[0-9]+$ ]]; then
+    ESPACIO_MSG="no se pudo medir el espacio libre en $1"; return 1
+  fi
+  # 5% del disco, nunca menos de 2 GB ni mas de 10 GB
+  reserva=$(( total / 20 ))
+  [ "$reserva" -lt 2097152 ] && reserva=2097152
+  [ "$reserva" -gt 10485760 ] && reserva=10485760
+  ESPACIO_MSG="en $1 hay $(( libre / 1024 )) MB libres, el respaldo necesita unos $(( $2 / 1024 )) MB y se reservan $(( reserva / 1024 )) MB para que el servidor siga funcionando"
+  [ $(( libre - $2 )) -ge "$reserva" ]
+}
+
+# bench se lanza como root, pero antes de escribir cambia al usuario del
+# bench (frappe_user). La carpeta de esta ejecucion tiene que ser suya; se
+# comprueba de verdad que pueda escribir en ella.
+preparar_carpeta_bench() {
+  local u g base
+  u="$(sed -n 's/.*"frappe_user"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+         "${BENCH_PATH}/sites/common_site_config.json" 2>/dev/null | head -n 1)"
+  [ -n "$u" ] || u="$(stat -c '%U' "$BENCH_PATH" 2>/dev/null)"
+  { [ -n "$u" ] && [ "$u" != "root" ]; } || return 0
+  g="$(id -gn "$u" 2>/dev/null)" || return 1
+  base="$(dirname "$TRABAJO")"
+  # La carpeta comun del gestor solo deja pasar, no listar.
+  [ "$(basename "$base")" = "izone-backup" ] && chmod 711 "$base" 2>/dev/null
+  { chgrp "$g" "$TRABAJO" && chmod 750 "$TRABAJO" \
+    && chown "${u}:${g}" "$EN_CURSO" && chmod 750 "$EN_CURSO"; } 2>/dev/null || return 1
+  if [ "$(id -un)" = "$u" ]; then
+    [ -w "$EN_CURSO" ] && [ -x "$EN_CURSO" ]
+  else
+    runuser -u "$u" -- test -w "$EN_CURSO" -a -x "$EN_CURSO" 2>/dev/null
+  fi
+}
+
+# Guarda la copia local de una ejecucion fallida y descarta las de fallos
+# anteriores del mismo tipo. Queda solo la mas reciente: una racha de
+# fallos no puede llenar el disco del servidor.
+conservar_local() {   # conservar_local <pendiente|danado>
+  local d
+  for d in "${TRABAJO}/$1-"*; do
+    [ -d "$d" ] && rm -rf "$d"
+  done
+  GUARDADO="${TRABAJO}/$1-${SELLO}"
+  mv "$EN_CURSO" "$GUARDADO" 2>/dev/null || GUARDADO="$EN_CURSO"
+}
+
+# Ejecuta una subida en segundo plano y cada minuto deja en el log cuanto
+# lleva. Sin esto, una subida de cientos de MB no muestra nada durante
+# muchos minutos y parece colgada. Si Google empieza a limitar las
+# peticiones (403), lo dice: es la causa habitual de subidas que no avanzan.
+con_progreso() {   # con_progreso <texto> <comando...>
+  local txt="$1" pid est ini t=0 linea avisado=0; shift
+  ini="$(stat -c %s "$RCLONE_LOG" 2>/dev/null || echo 0)"
+  # 9>&- : el candado no pasa a los hijos. Si este script muere, el candado
+  # muere con el y la siguiente ejecucion no queda bloqueada.
+  "$@" 9>&- &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    sleep 5 9>&-; t=$((t + 5))
+    [ $((t % 60)) -eq 0 ] || continue
+    kill -0 "$pid" 2>/dev/null || break
+    linea="$(tail -c +"$((ini + 1))" "$RCLONE_LOG" 2>/dev/null | grep -a 'Transferred:.*/s' \
+             | tail -n 1 | sed -E 's/.*Transferred:[[:space:]]*//')"
+    log "[INFO] ${txt}: ${linea:-preparando la subida...}  (${t}s)"
+    if [ "$avisado" -eq 0 ] && tail -c +"$((ini + 1))" "$RCLONE_LOG" 2>/dev/null \
+         | grep -aqE 'rateLimitExceeded|userRateLimitExceeded|Quota exceeded|Error 403'; then
+      log "[AVISO] Google esta limitando las peticiones (403). rclone reintenta con esperas,"
+      log "        por eso la subida avanza lento o parece detenida. Con las credenciales"
+      log "        compartidas de rclone pasa a menudo: conecte la cuenta con credenciales propias."
+      avisado=1
+    fi
+  done
+  wait "$pid"; est=$?
+  return "$est"
+}
+
+# Devuelve 0 si lo que quedo en Drive coincide con lo local, 1 si hay
+# diferencias o si no se pudo comprobar.
+comprobar_en_drive() {   # comprobar_en_drive <carpeta local> <destino>
+  local extra=() salida est sin_hash l
+  [ "${VERIFICAR_DESTINO:-hash}" = "descarga" ] && extra=(--download)
+  salida="$(rclone check "$1" "$2" --one-way "${extra[@]:+${extra[@]}}" \
+              --contimeout 30s --timeout 5m --retries 2 2>&1 9>&-)"; est=$?
+  printf '%s\n' "$salida" >> "$RCLONE_LOG" 2>/dev/null
+
+  if [ "$est" -ne 0 ]; then
+    printf '%s\n' "$salida" | grep -Ei "differ|missing|not in|error" | head -n 5 \
+      | while IFS= read -r l; do log "        $l"; done
+    return 1
+  fi
+
+  # Si rclone no pudo obtener el hash de algun archivo, para ese archivo
+  # solo comparo tamanos, y un archivo danado del mismo tamano pasaria
+  # inadvertido. Comprobado: con comparacion por tamano, un archivo
+  # corrupto del mismo peso devuelve 0. Asi que esto NO se deja pasar.
+  sin_hash="$(printf '%s' "$salida" \
+    | sed -nE 's/.*[^0-9]([0-9]+) hashes could not be checked.*/\1/p' | tail -n 1)"
+  if [ -n "$sin_hash" ] && [ "$sin_hash" -gt 0 ] 2>/dev/null; then
+    log "[ERROR] Google no devolvio el hash de ${sin_hash} archivo(s)."
+    log "        Solo se pudo comparar el tamano, y eso no prueba que el"
+    log "        contenido este bien. Se trata como fallo a proposito."
+    return 1
+  fi
+  return 0
+}
+
 # Retencion por niveles sobre <remoto>/<dd-mes-aaaa>
 retencion_niveles_drive() {
   local remoto="$1" dias="$2" mensual="$3" meses="$4"
@@ -1844,119 +1984,248 @@ retencion_niveles_drive() {
   done
 }
 
-FECHA="$(date +'%d-%B-%Y' | tr '[:upper:]' '[:lower:]')"
+# El nombre del mes siempre en ingles, igual en cron que en una ejecucion
+# manual: la retencion lo lee con LC_ALL=C.
+FECHA="$(LC_ALL=C date +'%d-%B-%Y' | tr '[:upper:]' '[:lower:]')"
 HORA="$(date +'%H-%M')"
-DESTINO="${RCLONE_REMOTE}:${DEST_PATH}/${FECHA}/${HORA}"
+SELLO="${FECHA}_${HORA}"
 
-log "[INFO] Inicio del respaldo de '${SITE}' hacia ${RCLONE_REMOTE}:${DEST_PATH}"
+# ---- 0. Una sola ejecucion a la vez ----------------------------------
+# Si cron dispara mientras sigue la anterior, o mientras corre una manual,
+# la segunda no se ejecuta: dos respaldos cruzados se pisarian.
+CANDADO="/run/lock/izone-backup-${JOB_NOMBRE}.lock"
+{ [ -d /run/lock ] && [ -w /run/lock ]; } || CANDADO="/tmp/izone-backup-${JOB_NOMBRE}.lock"
+exec 9>"$CANDADO" || { log "[ERROR] No se pudo crear el candado ${CANDADO}"; exit 1; }
+if ! flock -n 9; then
+  log "[AVISO] Otra ejecucion de este trabajo sigue en curso. Esta se omite."
+  exit 7
+fi
+# Si se interrumpe (Ctrl+C, kill), tambien se corta la subida en curso. Lo
+# que quedo a medias en Drive lleva el sufijo .subiendo y se limpia en la
+# siguiente ejecucion.
+trap 'log "[AVISO] Ejecucion interrumpida."; kill $(jobs -p) 2>/dev/null; exit 130' INT TERM
 
-# ---- 1. Carpeta temporal limpia -------------------------------------
-mkdir -p "$TEMP_LOCAL" || salir 1 FALLO "No se pudo crear $TEMP_LOCAL"
-rm -rf "${TEMP_LOCAL:?}"/*
+log "[INFO] Inicio del respaldo de '${SITE}' hacia ${REMOTO}"
+touch "$RCLONE_LOG" 2>/dev/null
 
-# ---- 2. Crear el respaldo -------------------------------------------
-cd "$BENCH_PATH" || salir 1 FALLO "No existe el bench: $BENCH_PATH"
+# ---- 1. Comprobaciones previas: si algo no esta listo, no se crea nada --
+command -v rclone >/dev/null 2>&1 || \
+  salir 1 FALLO "rclone no esta instalado. No se creo ningun respaldo."
+if ! rclone lsf "$REMOTO" --max-depth 1 "${RC_RAPIDO[@]}" >/dev/null 2>>"$RCLONE_LOG"; then
+  rcl mkdir "$REMOTO" "${RC_RAPIDO[@]}"
+  rclone lsf "$REMOTO" --max-depth 1 "${RC_RAPIDO[@]}" >/dev/null 2>>"$RCLONE_LOG" || \
+    salir 1 FALLO "No se alcanza ${REMOTO} en Google Drive. No se creo ningun respaldo."
+fi
+cd "$BENCH_PATH" 2>/dev/null || salir 1 FALLO "No existe el bench: $BENCH_PATH"
+mkdir -p "$TRABAJO" 2>/dev/null || salir 1 FALLO "No se pudo crear ${TRABAJO}"
+chmod 750 "$TRABAJO" 2>/dev/null
+
+# Restos de una ejecucion que se corto a la mitad (apagon, kill): no se
+# sabe en que estado quedaron, asi que no se usan para nada.
+if [ -e "$EN_CURSO" ]; then
+  log "[AVISO] Quedaron restos de una ejecucion interrumpida; se eliminan."
+  rm -rf "${EN_CURSO:?}"
+fi
+
+# Cuanto ocupara el respaldo: lo que peso el ultimo bueno, con margen. La
+# primera vez se estima por los adjuntos mas 1 GB para la base de datos.
+PREVIO_B="$(estado_valor ULTIMO_BYTES)"
+if [ -n "$PREVIO_B" ] && [ "$PREVIO_B" -gt 0 ] 2>/dev/null; then
+  NECESARIO_KB=$(( PREVIO_B / 1024 * 13 / 10 ))
+else
+  NECESARIO_KB=1048576
+  if [ "${WITH_FILES:-si}" = "si" ]; then
+    ADJ_KB="$(du -sk "${BENCH_PATH}/sites/${SITE}/public/files" \
+                     "${BENCH_PATH}/sites/${SITE}/private/files" 2>/dev/null \
+              | awk '{s+=$1} END {print s+0}')"
+    NECESARIO_KB=$(( NECESARIO_KB + ${ADJ_KB:-0} ))
+  fi
+fi
+
+# Si el disco no alcanza, bench no se ejecuta: un disco lleno si dejaria
+# sin servicio al servidor de produccion.
+espacio_suficiente "$TRABAJO" "$NECESARIO_KB" || \
+  salir 1 FALLO "Espacio insuficiente: ${ESPACIO_MSG}. No se ejecuto bench."
+
+DRIVE_LIBRE="$(rclone about "${RCLONE_REMOTE}:" --json "${RC_RAPIDO[@]}" 2>>"$RCLONE_LOG" \
+  | sed -n 's/^[[:space:]]*"free":[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1)"
+if [ -n "$DRIVE_LIBRE" ]; then
+  [ "$DRIVE_LIBRE" -ge $(( NECESARIO_KB * 1024 )) ] || \
+    salir 1 FALLO "Google Drive tiene $(( DRIVE_LIBRE / 1048576 )) MB libres y el respaldo necesita unos $(( NECESARIO_KB / 1024 )) MB. No se ejecuto bench."
+fi
+
+# ---- 2. Subidas de ESTE trabajo que quedaron a medias ------------------
+# Llevan el sufijo .subiendo.<trabajo>: nunca se confunden con un respaldo
+# bueno, ni con carpetas de otro trabajo.
+while IFS= read -r RESTO; do
+  RESTO="${RESTO%/}"
+  case "$RESTO" in */*"${SUFIJO}") ;; *) continue;; esac
+  log "[AVISO] Se elimina una subida que quedo a medias: ${RESTO}"
+  rcl purge "${REMOTO}/${RESTO}" "${RC_RED[@]}"
+  rcl rmdir "${REMOTO}/${RESTO%/*}" "${RC_RAPIDO[@]}"   # la fecha, solo si quedo vacia
+done < <(rclone lsf "$REMOTO" --dirs-only -R --max-depth 2 "${RC_RAPIDO[@]}" 2>>"$RCLONE_LOG")
+
+# ---- 3. Crear el respaldo, con el sitio en linea ---------------------
+# bench backup no detiene el sitio ni bloquea a los usuarios. Se ejecuta
+# con prioridad baja de CPU y disco para competir lo menos posible.
 # shellcheck disable=SC1091
 . env/bin/activate
+mkdir -p "$EN_CURSO" || salir 1 FALLO "No se pudo crear ${EN_CURSO}"
+RUTA_PROPIA="${BENCH_RUTA_PROPIA:-}"
+if [ -z "$RUTA_PROPIA" ]; then
+  # bench >= v13 acepta --backup-path. Solo se pide la ayuda: no respalda nada.
+  if timeout 120 bench --site "$SITE" backup --help 2>/dev/null | grep -q -- '--backup-path'; then
+    RUTA_PROPIA="si"
+  else
+    RUTA_PROPIA="no"
+  fi
+fi
+if [ "$RUTA_PROPIA" = "si" ] && ! preparar_carpeta_bench; then
+  log "[AVISO] El usuario del bench no puede escribir en ${EN_CURSO}; se usa la carpeta de respaldos del sitio."
+  RUTA_PROPIA="no"
+fi
+if [ "$RUTA_PROPIA" != "si" ]; then
+  # Sin carpeta propia, bench escribe primero en la carpeta del sitio.
+  mkdir -p "$BACKUP_ORIGEN" 2>/dev/null
+  if ! espacio_suficiente "$BACKUP_ORIGEN" "$NECESARIO_KB"; then
+    rm -rf "${EN_CURSO:?}"
+    salir 1 FALLO "Espacio insuficiente: ${ESPACIO_MSG}. No se ejecuto bench."
+  fi
+fi
+PRIO=(nice -n 10)
+command -v ionice >/dev/null 2>&1 && PRIO+=(ionice -c2 -n7 -t)
 BENCH_ARGS=(--site "$SITE" backup)
 [ "${WITH_FILES:-si}" = "si" ] && BENCH_ARGS+=(--with-files)
-SALIDA_BENCH="$(bench "${BENCH_ARGS[@]}" 2>&1)" || {
+if [ "$RUTA_PROPIA" = "si" ]; then
+  BENCH_ARGS+=(--backup-path "$EN_CURSO")
+else
+  # Se toman SOLO los archivos que aparezcan desde este momento; lo que ya
+  # hubiera en la carpeta del sitio pertenece a otros y no se toca.
+  MARCA="${TRABAJO}/.inicio"
+  touch -d "@$(( $(date +%s) - 2 ))" "$MARCA"
+fi
+log "[INFO] Ejecutando bench backup con prioridad baja (el sitio sigue en linea)..."
+SALIDA_BENCH="$("${PRIO[@]}" bench "${BENCH_ARGS[@]}" 2>&1 9>&-)" || {
   printf '%s\n' "$SALIDA_BENCH" | tail -n 15
+  rm -rf "${EN_CURSO:?}"
   salir 2 FALLO "'bench backup' fallo para $SITE"
 }
-
-if [ ! -d "$BACKUP_ORIGEN" ] || [ -z "$(ls -A "$BACKUP_ORIGEN" 2>/dev/null)" ]; then
-  salir 5 FALLO "bench no dejo ningun archivo en $BACKUP_ORIGEN"
+if [ "$RUTA_PROPIA" != "si" ]; then
+  find "$BACKUP_ORIGEN" -maxdepth 1 -type f -newer "$MARCA" -exec mv -t "$EN_CURSO" {} + 2>/dev/null
+  rm -f "$MARCA"
 fi
 
-# ---- 3. Verificar ANTES de subir y ANTES de borrar nada --------------
-verificar_respaldo "$BACKUP_ORIGEN" "${VERIFICAR:-si}"; VERIF=$?
+# Que bench devuelva 0 no garantiza que dejara archivos.
+if [ -z "$(ls -A "$EN_CURSO" 2>/dev/null)" ]; then
+  rm -rf "${EN_CURSO:?}"
+  salir 5 FALLO "bench no dejo ningun archivo del respaldo."
+fi
+
+# ---- 4. Verificar ANTES de subir nada --------------------------------
+# Solo se verifica lo que creo ESTA ejecucion: un archivo danado de otra
+# corrida ya no puede bloquear a las siguientes.
+verificar_respaldo "$EN_CURSO" "${VERIFICAR:-si}"; VERIF=$?
 if [ "$VERIF" -eq 1 ]; then
-  salir 6 FALLO "El respaldo recien creado esta danado. Se conserva en ${BACKUP_ORIGEN} y no se subio nada."
+  conservar_local danado
+  salir 6 FALLO "El respaldo recien creado esta danado. No se subio nada y la retencion no se aplico. Se conserva para revision en ${GUARDADO}; las siguientes ejecuciones no dependen de el."
 fi
-[ "${VERIFICAR:-si}" = "no" ] || escribir_huellas "$BACKUP_ORIGEN"
-
-# ---- 4. Armar el paquete y subirlo ----------------------------------
-cp -r "$BACKUP_ORIGEN"/* "$TEMP_LOCAL"/ || salir 3 FALLO "No se pudo copiar a $TEMP_LOCAL"
-
-if ! rclone copy "$TEMP_LOCAL" "$DESTINO" \
-     --contimeout 30s --timeout 5m --retries 3 --low-level-retries 10 \
-     --log-file="$RCLONE_LOG" --log-level INFO; then
-  rm -rf "${TEMP_LOCAL:?}"/*
-  salir 4 FALLO "Fallo la subida hacia $DESTINO" "$DESTINO"
+N_ARCH="$(find "$EN_CURSO" -maxdepth 1 -type f ! -name SHA256SUMS | wc -l)"
+if [ "${VERIFICAR:-si}" != "no" ]; then
+  escribir_huellas "$EN_CURSO"
+  N_HUELLAS="$(grep -c . "${EN_CURSO}/SHA256SUMS" 2>/dev/null)"
+  if [ "$N_ARCH" -eq 0 ] || [ "$N_ARCH" != "${N_HUELLAS:-0}" ]; then
+    conservar_local danado
+    salir 6 FALLO "No se pudo calcular la huella de todos los archivos (${N_HUELLAS:-0} de ${N_ARCH}). No se subio nada."
+  fi
 fi
+TAMANO="$(du -sh "$EN_CURSO" 2>/dev/null | cut -f1)"
 
-# ---- 5. Comprobar que lo que quedo en Drive sea lo que se subio ------
-# Devuelve 0 si coincide, 1 si hay diferencias o si no se pudo comprobar.
-comprobar_en_drive() {   # comprobar_en_drive <carpeta local> <destino>
-  local extra=() salida est sin_hash l
-  [ "${VERIFICAR_DESTINO:-hash}" = "descarga" ] && extra=(--download)
-  salida="$(rclone check "$1" "$2" --one-way "${extra[@]:+${extra[@]}}" \
-              --contimeout 30s --timeout 5m --retries 2 2>&1)"; est=$?
-  printf '%s\n' "$salida" >> "$RCLONE_LOG" 2>/dev/null
-
-  if [ "$est" -ne 0 ]; then
-    printf '%s\n' "$salida" | grep -Ei "differ|missing|not in|error" | head -n 5 \
-      | while IFS= read -r l; do log "        $l"; done
-    return 1
+# ---- 5. Subir a una carpeta provisional y comprobarla ----------------
+# Mientras se sube y se comprueba, la carpeta lleva el sufijo .subiendo:
+# nadie puede confundirla con un respaldo bueno. Solo recibe su nombre
+# definitivo despues de comprobarla.
+existe_en_drive() { rclone lsf "${REMOTO}/${FECHA}" --dirs-only "${RC_RAPIDO[@]}" 2>/dev/null | grep -qx "$1/"; }
+if existe_en_drive "$HORA"; then
+  HORA="$(date +'%H-%M-%S')"
+  N=1
+  while existe_en_drive "$HORA" && [ "$N" -lt 9 ]; do
+    N=$((N+1)); HORA="$(date +'%H-%M-%S')-${N}"
+  done
+  if existe_en_drive "$HORA"; then
+    conservar_local pendiente
+    salir 4 FALLO "Ya existe ${FECHA}/${HORA} en Drive y no se sobrescribe. El respaldo verificado se conserva en ${GUARDADO}."
   fi
-
-  # Si rclone no pudo obtener el hash de algun archivo, para ese archivo
-  # solo comparo tamanos, y un archivo danado del mismo tamano pasaria
-  # inadvertido. Comprobado: con comparacion por tamano, un archivo
-  # corrupto del mismo peso devuelve 0. Asi que esto NO se deja pasar.
-  sin_hash="$(printf '%s' "$salida" \
-    | sed -nE 's/.*[^0-9]([0-9]+) hashes could not be checked.*/\1/p' | tail -n 1)"
-  if [ -n "$sin_hash" ] && [ "$sin_hash" -gt 0 ] 2>/dev/null; then
-    log "[ERROR] Google no devolvio el hash de ${sin_hash} archivo(s)."
-    log "        Solo se pudo comparar el tamano, y eso no prueba que el"
-    log "        contenido este bien. Se trata como fallo a proposito."
-    return 1
-  fi
-  return 0
-}
+fi
+FINAL="${REMOTO}/${FECHA}/${HORA}"
+PROVISIONAL="${FINAL}${SUFIJO}"
 
 INTENTO=1
 while :; do
-  if [ "${VERIFICAR_DESTINO:-hash}" = "descarga" ]; then
-    log "[INFO] Comprobando en Drive: se descarga de vuelta y se compara byte a byte..."
+  log "[INFO] Subiendo a Google Drive ${N_ARCH} archivo(s), ${TAMANO:-?} (intento ${INTENTO} de 2)..."
+  if con_progreso "Subiendo" rclone copy "$EN_CURSO" "$PROVISIONAL" "${RC_RED[@]}" \
+       --stats 30s --log-file="$RCLONE_LOG" --log-level INFO; then
+    if [ "${VERIFICAR_DESTINO:-hash}" = "descarga" ]; then
+      log "[INFO] Comprobando en Drive: se descarga de vuelta y se compara byte a byte..."
+    else
+      log "[INFO] Comprobando en Drive: se comparan los hashes que reporta Google..."
+    fi
+    comprobar_en_drive "$EN_CURSO" "$PROVISIONAL" && break
+    log "[AVISO] Lo que quedo en Drive no coincide con lo que se subio."
   else
-    log "[INFO] Comprobando en Drive: se comparan los hashes que reporta Google..."
+    log "[AVISO] La subida a Drive fallo. El detalle esta en ${RCLONE_LOG}"
   fi
-  comprobar_en_drive "$TEMP_LOCAL" "$DESTINO" && break
-
+  rcl purge "$PROVISIONAL" "${RC_RED[@]}"
   if [ "$INTENTO" -ge 2 ]; then
-    rm -rf "${TEMP_LOCAL:?}"/*
-    salir 4 FALLO "Lo que quedo en ${DESTINO} no coincide con lo que se subio, ni siquiera tras resubirlo. El respaldo local NO se borro." "$DESTINO"
+    rcl rmdir "${REMOTO}/${FECHA}" "${RC_RAPIDO[@]}"
+    conservar_local pendiente
+    salir 4 FALLO "No se logro dejar en Drive una copia identica, ni al reintentar. Se borro lo subido; el respaldo verificado se conserva en ${GUARDADO}."
   fi
-  # Esto es lo que usted haria a mano: borrar lo que quedo mal y subirlo
-  # otra vez. Se hace aqui mismo, mientras el respaldo local todavia existe.
-  log "[AVISO] La copia en Drive no coincide. Se borra y se sube de nuevo."
-  rclone purge "$DESTINO" >/dev/null 2>&1
-  if ! rclone copy "$TEMP_LOCAL" "$DESTINO" \
-       --contimeout 30s --timeout 5m --retries 3 --low-level-retries 10 \
-       --log-file="$RCLONE_LOG" --log-level INFO; then
-    rm -rf "${TEMP_LOCAL:?}"/*
-    salir 4 FALLO "Fallo el reintento de subida hacia ${DESTINO}. El respaldo local NO se borro." "$DESTINO"
-  fi
+  log "[AVISO] Se borra lo subido y se intenta una vez mas."
   INTENTO=2
 done
 log "[OK] Comprobado en Drive: lo que quedo alla es identico a lo que se subio."
 
-# ---- 6. Recien ahora se libera el disco local ------------------------
-if [ "${BORRAR_ORIGEN:-si}" = "si" ]; then
-  find "$BACKUP_ORIGEN" -mindepth 1 -type f -delete 2>/dev/null
+# ---- 6. Nombre definitivo --------------------------------------------
+# Drive renombra la carpeta por su cuenta, sin volver a subir nada. Luego
+# se confirma que el nombre definitivo tenga todos los archivos.
+if ! rcl moveto "$PROVISIONAL" "$FINAL" "${RC_RED[@]}" \
+   || ! rcl check "$EN_CURSO" "$FINAL" --one-way --size-only "${RC_RAPIDO[@]}"; then
+  rcl purge "$FINAL" "${RC_RED[@]}"
+  rcl purge "$PROVISIONAL" "${RC_RED[@]}"
+  rcl rmdir "${REMOTO}/${FECHA}" "${RC_RAPIDO[@]}"
+  conservar_local pendiente
+  salir 4 FALLO "No se pudo dar el nombre definitivo en Drive. Se borro lo subido; el respaldo verificado se conserva en ${GUARDADO}."
 fi
-rm -rf "${TEMP_LOCAL:?}"/*
+log "[OK] Respaldo guardado en ${FINAL} (${N_ARCH} archivos, ${TAMANO:-?})"
 
-# ---- 7. Retencion: solo despues de un respaldo bueno -----------------
-retencion_niveles_drive "${RCLONE_REMOTE}:${DEST_PATH}" "${RETENCION_DIAS:-0}" \
+# ---- 7. Recien ahora se libera el disco local ------------------------
+if [ "${BORRAR_ORIGEN:-si}" = "si" ]; then
+  rm -rf "${EN_CURSO:?}"
+else
+  # El trabajo pide conservar la copia local: queda en la carpeta de
+  # respaldos del sitio, donde Frappe la muestra, como hasta ahora.
+  mkdir -p "$BACKUP_ORIGEN" 2>/dev/null
+  rm -f "${EN_CURSO}/SHA256SUMS"
+  if find "$EN_CURSO" -maxdepth 1 -type f -exec mv -t "$BACKUP_ORIGEN" {} + 2>/dev/null; then
+    log "[INFO] Copia local conservada en ${BACKUP_ORIGEN}"
+  else
+    log "[AVISO] No se pudo mover la copia local a ${BACKUP_ORIGEN}; queda en ${EN_CURSO}"
+  fi
+  rmdir "$EN_CURSO" 2>/dev/null
+fi
+for D in "${TRABAJO}"/pendiente-* "${TRABAJO}"/danado-*; do
+  [ -d "$D" ] || continue
+  rm -rf "$D" && log "[INFO] Se descarta la copia local de un fallo anterior: $(basename "$D")"
+done
+
+# ---- 8. Retencion: solo despues de un respaldo bueno -----------------
+retencion_niveles_drive "$REMOTO" "${RETENCION_DIAS:-0}" \
   "${MENSUAL_CONSERVAR:-no}" "${MENSUAL_MESES:-0}"
 
 if [ "$VERIF" -eq 2 ]; then
-  salir 0 AVISO "Respaldo correcto en ${DESTINO}, pero mucho mas pequeno que el anterior." "$DESTINO"
+  salir 0 AVISO "Respaldo correcto en ${FINAL}, pero mucho mas pequeno que el anterior." "$FINAL"
 fi
-salir 0 OK "Respaldo verificado en ${DESTINO}" "$DESTINO"
+salir 0 OK "Respaldo verificado en ${FINAL}" "$FINAL"
 EOF
   chmod 750 "$2"
 }
@@ -2956,7 +3225,7 @@ crear_trabajo_drive() {
 
   local ETIQUETA="" JOB="" CONF="" SCRIPT="" LOG_FILE="" RCLONE_LOG="" ESTADO_FILE=""
   local RCLONE_REMOTE="" DEST_PATH="" TEMP_LOCAL="" VERIFICAR="si"
-  local VERIFICAR_DESTINO="hash" TIPO_TRABAJO="drive" METODO_RED=""
+  local VERIFICAR_DESTINO="hash" TIPO_TRABAJO="drive" METODO_RED="" DIR_TRABAJO=""
   local BENCH_PATH="" SITE="" BACKUP_ORIGEN="" WITH_FILES="" BORRAR_ORIGEN="si"
   local RETENCION_DIAS="" MENSUAL_CONSERVAR="no" MENSUAL_MESES="0" HORARIOS="" DIAS_CRON=""
   local paso=1 estado NAV_ON=1 volver_resumen=0
@@ -3056,8 +3325,10 @@ drv_paso_carpeta() {
 drv_paso_temporal() {
   pantalla "TRABAJO '${ETIQUETA}'  >  [4 de 9] Carpeta temporal"
   aviso_navegacion
-  say "  ${C_DIM}Aqui se arma el paquete antes de subirlo. Se vacia al terminar.${C_R}"
-  pedir TEMP_LOCAL "Carpeta temporal de trabajo" "${TEMP_LOCAL:-/tmp/${JOB}}" || return $?
+  # Misma comprobacion que la red sin montaje: ruta absoluta y en disco.
+  DIR_TRABAJO="$TEMP_LOCAL"
+  pedir_dir_trabajo || return $?
+  TEMP_LOCAL="$DIR_TRABAJO"
   return 0
 }
 
@@ -3138,7 +3409,7 @@ drv_paso_resumen() {
     "MENSUAL_CONSERVAR=${MENSUAL_CONSERVAR}" "MENSUAL_MESES=${MENSUAL_MESES}" \
     "HORARIOS=${HORARIOS}" "DIAS_CRON=${DIAS_CRON}" \
     "LOG_FILE=${LOG_FILE}" "RCLONE_LOG=${RCLONE_LOG}" "ESTADO_FILE=${ESTADO_FILE}" \
-    "GEN_VERSION=${GEN_VERSION_ACTUAL}"
+    "GEN_VERSION=${GEN_VERSION_DRIVE}"
 
   if ! instalar_script generar_script_drive "$CONF" "$SCRIPT"; then
     pantalla "TRABAJO '${ETIQUETA}'  >  Resultado"
@@ -3626,7 +3897,7 @@ comprobar_respaldo_guardado() {   # comprobar_respaldo_guardado <archivo .conf>
     res="$( cd "$ruta" && sha256sum -c SHA256SUMS 2>&1 )"
   else
     lista="$(rc lsf "${RCLONE_REMOTE}:${DEST_PATH}" --dirs-only -R 2>/dev/null \
-             | sed 's:/$::' | grep '/' )"
+             | sed 's:/$::' | grep '/' | grep -v '\.subiendo\.' )"
     elegir_carpeta_respaldo "$lista" || { enter; return 1; }
     ruta="${RCLONE_REMOTE}:${DEST_PATH}/${CARPETA_ELEGIDA}"
     echo
@@ -3666,11 +3937,21 @@ comprobar_respaldo_guardado() {   # comprobar_respaldo_guardado <archivo .conf>
 # Actualizar el gestor NO actualiza los scripts ya generados: siguen en
 # disco tal como se escribieron. Sin esto, un trabajo creado con una
 # version anterior seguiria respaldando sin verificar nada.
+# Version que debe tener el script de un trabajo segun su tipo.
+version_generada() {   # version_generada <JOB_TIPO>
+  case "$1" in
+    drive) printf '%s' "$GEN_VERSION_DRIVE";;
+    *)     printf '%s' "$GEN_VERSION_ACTUAL";;
+  esac
+}
+
 migrar_trabajos() {
-  local c tipo job metodo gen n=0 fallos=0
+  local c tipo job metodo gen ver n=0 nd=0 fallos=0
   while IFS= read -r c; do
     [ -n "$c" ] || continue
-    grep -q "^GEN_VERSION=\"${GEN_VERSION_ACTUAL}\"" "$c" 2>/dev/null && continue
+    tipo="$(sed -n 's/^JOB_TIPO="\(.*\)"$/\1/p' "$c" | tail -n 1)"
+    ver="$(version_generada "$tipo")"
+    grep -q "^GEN_VERSION=\"${ver}\"" "$c" 2>/dev/null && continue
     grep -q '^VERIFICAR='   "$c" 2>/dev/null || set_conf "$c" VERIFICAR "si"
     if ! grep -q '^VERIFICAR_DESTINO=' "$c" 2>/dev/null; then
       if grep -q '^JOB_TIPO="drive"' "$c" 2>/dev/null; then
@@ -3680,7 +3961,6 @@ migrar_trabajos() {
       fi
     fi
     grep -q '^ESTADO_FILE=' "$c" 2>/dev/null || set_conf "$c" ESTADO_FILE "${c%.conf}.estado"
-    tipo="$(sed -n 's/^JOB_TIPO="\(.*\)"$/\1/p'      "$c" | tail -n 1)"
     job="$(sed  -n 's/^JOB_NOMBRE="\(.*\)"$/\1/p'    "$c" | tail -n 1)"
     metodo="$(sed -n 's/^METODO_RED="\(.*\)"$/\1/p'  "$c" | tail -n 1)"
     if [ -n "$job" ]; then
@@ -3692,9 +3972,9 @@ migrar_trabajos() {
       if ! instalar_script "$gen" "$c" "${BIN_DIR}/${job}.sh"; then
         fallos=$((fallos+1)); continue   # el script anterior sigue intacto
       fi
-      n=$((n+1))
+      n=$((n+1)); [ "$tipo" = "drive" ] && nd=$((nd+1))
     fi
-    set_conf "$c" GEN_VERSION "$GEN_VERSION_ACTUAL"
+    set_conf "$c" GEN_VERSION "$ver"
   done < <(listar_confs)
 
   if [ "$fallos" -gt 0 ]; then
@@ -3705,16 +3985,26 @@ migrar_trabajos() {
   fi
   [ "$n" -eq 0 ] && return 0
   pantalla "ACTUALIZACION DE TRABAJOS"
-  ok "Se actualizaron ${n} trabajo(s) a la version ${GEN_VERSION_ACTUAL}."
-  echo
-  say "  A partir de ahora, antes de dar un respaldo por bueno se comprueba que"
-  say "  el volcado se pueda abrir y que no haya quedado a la mitad. Si la"
-  say "  comprobacion falla, el respaldo local no se borra y la retencion no se"
-  say "  aplica, para no perder un respaldo bueno por uno danado."
-  echo
+  if [ $((n - nd)) -gt 0 ]; then
+    ok "Se actualizaron $((n - nd)) trabajo(s) de Unidad de Red a la version ${GEN_VERSION_ACTUAL}."
+    echo
+    say "  A partir de ahora, antes de dar un respaldo por bueno se comprueba que"
+    say "  el volcado se pueda abrir y que no haya quedado a la mitad. Si la"
+    say "  comprobacion falla, el respaldo local no se borra y la retencion no se"
+    say "  aplica, para no perder un respaldo bueno por uno danado."
+    echo
+  fi
+  if [ "$nd" -gt 0 ]; then
+    ok "Se actualizaron ${nd} trabajo(s) de Google Drive a la version ${GEN_VERSION_DRIVE}."
+    echo
+    say "  Cada respaldo se arma ahora en su propia carpeta y se sube solo eso:"
+    say "  los respaldos automaticos de Frappe y los restos de otras corridas ya"
+    say "  no se suben, no se borran y no bloquean la verificacion. La subida"
+    say "  muestra su avance cada minuto y queda en una carpeta provisional"
+    say "  .subiendo hasta que Drive confirma que llego identica."
+    echo
+  fi
   say "  ${C_DIM}Los horarios, destinos y retenciones no cambiaron.${C_R}"
-  say "  ${C_DIM}La verificacion quedo en 'completa'; se puede ajustar desde${C_R}"
-  say "  ${C_DIM}cada trabajo, en 'Que se respalda'.${C_R}"
   enter
   return 0
 }
